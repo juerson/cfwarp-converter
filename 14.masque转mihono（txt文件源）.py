@@ -65,7 +65,7 @@ if __name__ == "__main__":
     prxies = []
     for i, item in islice(ips.items(), 50): # 限制只取前50个节点
         name = f"【{str(i).zfill(len(str(total)))}】{item['ip']}({item['port']})"
-        node_data = {"name": name,"type":"masque","server":item['ip'],"port":item['port'],"private-key":config["private_key"],"public-key":config["pub_key"],"ip":config["endpoint_v4"],"ipv6":config["endpoint_v6"],"mtu":1281,"udp":True,"remote-dns-resolve":True,"dns":["8.8.8.8","2001:4860:4860::8844"]}
+        node_data = {"name": name,"type":"masque","server":item['ip'],"port":item['port'],"private-key":config["private_key"],"public-key":config["pub_key"],"ip":config["ipv4"],"ipv6":config["ipv6"],"mtu":1281,"udp":True,"remote-dns-resolve":True,"dns":["8.8.8.8","2001:4860:4860::8844"]}
         node_masque = json.dumps(node_data, ensure_ascii=False)
         names.append(f"      - {name}")
         prxies.append(f"  - {node_masque}")
