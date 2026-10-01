@@ -1,0 +1,325 @@
+{
+  "$schema": "https://sing-box.sagernet.org/schema.json",
+  "log": {
+    "disabled": false,
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "final": "dns_direct",
+    "rules": [
+      {
+        "action": "predefined",
+        "rcode": "REFUSED",
+        "rule_set": [
+          "geosite-adblockplus"
+        ]
+      },
+      {
+        "action": "route",
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "rule_set": [
+          "geosite-geolocation-!cn",
+          "geosite-category-ai-!cn",
+          "geosite-youtube",
+          "geosite-google",
+          "geosite-microsoft",
+          "geosite-telegram",
+          "geosite-netflix",
+          "geosite-github"
+        ],
+        "server": "dns_fakeip"
+      },
+      {
+        "action": "route",
+        "query_type": [
+          "CNAME",
+          "HTTPS",
+          "SVCB"
+        ],
+        "rule_set": [
+          "geosite-geolocation-!cn"
+        ],
+        "server": "dns_proxy"
+      }
+    ],
+    "servers": [
+      {
+        "detour": "🌍全球",
+        "domain_resolver": "dns_resolver",
+        "server": "1.1.1.1",
+        "tag": "dns_proxy",
+        "type": "tls"
+      },
+      {
+        "domain_resolver": "dns_resolver",
+        "server": "dns.alidns.com",
+        "tag": "dns_direct",
+        "type": "https"
+      },
+      {
+        "tag": "dns_resolver",
+        "type": "local"
+      },
+      {
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18",
+        "tag": "dns_fakeip",
+        "type": "fakeip"
+      }
+    ],
+    "strategy": "prefer_ipv4"
+  },
+  "ntp": {
+    "enabled": true,
+    "interval": "30m",
+    "server": "ntp.aliyun.com",
+    "server_port": 123
+  },
+  "http_clients": [
+    {
+      "tag": "ruleset-download"
+    }
+  ],
+  "endpoints": [],
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "listen_port": 2080,
+      "set_system_proxy": false,
+      "tag": "mixed-in",
+      "type": "mixed"
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "🚀代理",
+      "type": "selector",
+      "outbounds": [
+        "⚡自动",
+        "DIRECT",
+        "{all}"
+      ]
+    },
+    {
+      "tag": "⚡自动",
+      "type": "urltest",
+      "outbounds": [
+        "{all}"
+      ],
+      "url": "http://www.gstatic.com/generate_204",
+      "interval": "10m",
+      "tolerance": 150
+    },
+    {
+      "tag": "🛡️广告",
+      "type": "selector",
+      "outbounds": [
+        "REJECT",
+        "DIRECT"
+      ]
+    },
+    {
+      "tag": "🌍全球",
+      "type": "selector",
+      "outbounds": [
+        "🚀代理",
+        "⚡自动"
+      ]
+    },
+    {
+      "tag": "DIRECT",
+      "type": "direct"
+    },
+    {
+      "tag": "REJECT",
+      "type": "block"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns_direct",
+    "final": "🌍全球",
+    "rule_set": [
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-geolocation-!cn",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-geolocation-!cn.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-cn",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geoip-cn",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-adblockplus",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-adblockplus.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-google",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-google.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-apple@cn",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-apple@cn.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-microsoft",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-microsoft.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-telegram",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-telegram.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-youtube",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-youtube.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-netflix",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-netflix.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-github",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-github.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-category-ai-!cn",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-category-ai-!cn.srs"
+      },
+      {
+        "format": "binary",
+        "http_client": "ruleset-download",
+        "tag": "geosite-private",
+        "type": "remote",
+        "update_interval": "5d",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-private.srs"
+      }
+    ],
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "action": "hijack-dns",
+        "protocol": "dns"
+      },
+      {
+        "action": "route",
+        "clash_mode": "Global",
+        "outbound": "🌍全球"
+      },
+      {
+        "action": "route",
+        "clash_mode": "Direct",
+        "outbound": "DIRECT"
+      },
+      {
+        "action": "route",
+        "ip_is_private": true,
+        "outbound": "DIRECT"
+      },
+      {
+        "action": "route",
+        "rule_set": [
+          "geosite-adblockplus"
+        ],
+        "outbound": "🛡️广告"
+      },
+      {
+        "action": "route",
+        "rule_set": [
+          "geosite-private",
+          "geosite-apple@cn",
+          "geosite-cn"
+        ],
+        "outbound": "DIRECT"
+      },
+      {
+        "action": "route",
+        "rule_set": [
+          "geosite-category-ai-!cn",
+          "geosite-youtube",
+          "geosite-google",
+          "geosite-microsoft",
+          "geosite-telegram",
+          "geosite-netflix",
+          "geosite-github"
+        ],
+        "outbound": "🌍全球"
+      },
+      {
+        "action": "route",
+        "rule_set": [
+          "geoip-cn"
+        ],
+        "outbound": "DIRECT"
+      }
+    ]
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "store_dns": true,
+      "store_fakeip": true
+    },
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "external_ui": "dashboard",
+      "external_ui_download_url": "https://gh-proxy.com/https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"
+    }
+  }
+}
