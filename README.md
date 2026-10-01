@@ -64,6 +64,15 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple # �
 # 执行指定的python脚本，看python文件名就知道功能了
 python 0.注册wg和masque账号.py
 ....
+
+# 用 Python 开启一个简单的本地 HTTP 服务
+
+python -m http.server 80
+
+# 代理软件使用远程订阅`output-*.json | .yaml | .txt`文件内容：
+http://127.0.0.1:80/
+http://127.0.0.1/
+http://localhost/
 ```
 
 前面执行一遍，下次再使用，就执行：
