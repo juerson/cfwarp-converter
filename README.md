@@ -47,7 +47,7 @@ cfwarp转换工具集，将 Cloudflare WARP 官方的 WireGuard（AmneziaWG ） 
 
 5、需要使用其他工具优选IP地址，替换文件 `ip.txt` 和 `result.csv` 的数据使用，注意，转换时，默认选择 `result.csv` 文件，可选`ip.txt` 文件，不要选错文件选错优选IP，导致写错**端点**地址到节点，最后测试发现连接都失效。
 
-6、如果发现测试延迟都失败，可以考虑更换测试延迟的URL，例如：https://www.gstatic.com/generate_204、https://cp.cloudflare.com/generate_204、https://www.google.com/generate_204
+6、如果发现测试延迟都失败，可以考虑更换测试延迟的URL，例如：https://www.gstatic.com/generate_204 、 https://cp.cloudflare.com/generate_204 、 https://www.google.com/generate_204
 
 7、裸核跑代理的，可以在浏览器中打开对应的控制面板切换节点
 
@@ -55,6 +55,7 @@ cfwarp转换工具集，将 Cloudflare WARP 官方的 WireGuard（AmneziaWG ） 
 
   （1）访问本地版 http://127.0.0.1:9091 或者访问官网 https://sing-box-dashboard.sagernet.org/
   填URL： http://127.0.0.1:9091
+
   （2）访问本地版 http://127.0.0.1:9090 或者访问官网 https://metacubex.github.io/metacubexd/ 
   填后端地址：http://127.0.0.1:9090
 
