@@ -6,26 +6,17 @@ cfwarp转换工具集，将 Cloudflare WARP 官方的 WireGuard（AmneziaWG ） 
 
 ### 一、支持
 
-| 客户端 / 内核 | WireGuard | MASQUE | AWG (AmneziaWG)[^3] | 前三列任意支持项 + OpenVPN |
+| 客户端 / 内核 | WireGuard | MASQUE | [AWG (AmneziaWG)](# "基于 WireGuard 协议而升级，详情：https://github.com/amnezia-vpn/amneziawg-go") | 前三列任意支持项 + OpenVPN |
 | --- | :---: | :---: | :---: | :---: |
 | Throne for PC / Android | ✅ | ✅ | ✅ | ❌ |
-| NekoBox by qr243vbi[^1] | ✅ | ❌ | ✅ | ❌ |
-| NekoBox For PC[^2] / Android     |     ✅     | ❌ | ❌ | ❌ |
+| [NekoBox by qr243vbi](# "v5.11.28.3 版本为基准") | ✅ | ❌ | ✅ | ❌ |
+| [NekoBox For PC](# "v4.0.1-v4.2.7 老版本") / Android     |     ✅     | ❌ | ❌ | ❌ |
 | v2rayN / v2rayNG | ✅ | ❌ | ❌ | ❌ |
-| Hiddify[^new] for PC / Android | ✅ | ✅ | ✅ | ❌[^7] |
-| sing-box 内核[^4] | ✅ | ❌ | ❌ | ✅ |
+| [Hiddify](# "新版支持") for PC / Android | ✅ | ✅ | ✅ | [❌](# "没有用到 OpenVPN") |
+| [sing-box 内核](# "包括桌面端 SFW 和安卓端 SFA") | ✅ | ❌ | ❌ | ✅ |
 | sing-box-lx 内核 | ✅ | ✅ | ✅ | ✅ |
-| mihomo 内核[^5] | ✅ | ✅ | ✅ | ✅ |
-| clash-rs 内核[^6] | ✅ | ❌ | ❌ | ❌ |
-
-[^1]: v5.11.28.3
-[^2]: v4.0.1-v4.2.7 老版本
-[^3]: 基于 WireGuard 协议而升级，详情：https://github.com/amnezia-vpn/amneziawg-go
-[^4]: 包括桌面端 SFW 和安卓端 SFA
-[^5]: 包括对应的桌面端和移动端，比如：Clash Verge rev、Clash Party、FlClash 等
-[^6]: 包括桌面端 clash-nyanpasu 里面有一个 clash-rs 内核可切换使用
-[^7]: 没有用到 OpenVPN
-[^new]: 新版支持
+| [mihomo 内核](# "包括对应的桌面端和移动端，比如：Clash Verge rev、Clash Party、FlClash 等") | ✅ | ✅ | ✅ | ✅ |
+| [clash-rs 内核](# "包括桌面端 clash-nyanpasu 里面有一个 clash-rs 内核可切换使用") | ✅ | ❌ | ❌ | ❌ |
 
 ##### 1、sing-box 内核代表
 
@@ -158,9 +149,9 @@ python main.py -h
 
 ![](images/[masque]throme-pc.png)
 
-![](images/[wireguard]NyameBox(lblis amnezia).png)
+![](images/[wireguard]NyameBox(lblis%20amnezia).png)
 
-![](images/[wireguard]Clash Verge.png)
+![](images/[wireguard]Clash%20Verge.png)
 
 ![](images/[masque]clash-party.png)
 
