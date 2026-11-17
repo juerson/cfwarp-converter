@@ -1,0 +1,217 @@
+mixed-port: 10801
+allow-lan: false
+bind-address: "*"
+mode: rule
+log-level: debug
+ipv6: true
+# 必须显式给 mmdb 路径（否则 GEOIP 规则不生效），首次使用时按下方地址下载
+mmdb: "geoip.metadb"
+mmdb-download-url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb"
+geosite-download-url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"
+external-controller: "0.0.0.0:9093"
+# 必须设置 secret，否则 API 服务不启动
+secret: "clashrs-9093"
+cors-allow-origins:
+  - "*"
+external-ui: ui
+external-ui-url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
+profile:
+  store-selected: true
+  store-fake-ip: true
+tun:
+  enable: false
+  dns-hijack:
+    - 0.0.0.0:53
+dns:
+  enable: true
+  # 53 端口在 Windows 常被系统/保留端口占用（os error 10013），改用 1053；
+  # 核心内部解析不依赖此监听，TUN 关闭时仅影响手动指向本机 DNS 的场景
+  listen: 0.0.0.0:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 10.0.0.0/8
+  fake-ip-filter:
+    - '+.lan'
+    - '+.local'
+    - '+.localdomain'
+    - '+.msftconnecttest.com'
+    - '+.msftncsi.com'
+    - '+.stun.*.*'
+    - '+.stun.*.*.*'
+    - '+.stun.*.*.*.*'
+    - '+.srv.nintendo.net'
+    - '+.stun.playstation.net'
+    - 'xbox.*.microsoft.com'
+    - '+.xboxlive.com'
+    - '+.battlenet.com.cn'
+    - '+.battle.net'
+    - '+.blzstatic.cn'
+    - 'localhost.ptlogin2.qq.com'
+    - 'localhost.sec.qq.com'
+    - 'localhost.work.weixin.qq.com'
+    - '+.nvidia.com'
+    - '+.market.xiaomi.com'
+    - 'time.*.com'
+    - 'time.*.gov'
+    - 'time.*.edu.cn'
+    - '+.time.edu.cn'
+    - '+.ntp.org'
+    - '+.pool.ntp.org'
+    - 'time1.cloud.tencent.com'
+  default-nameserver:
+    - 223.5.5.5
+  # 国外域名 DNS 走代理：respect-rules 让上游查询按规则分流
+  respect-rules: true
+  nameserver:
+    - "https://1.1.1.1/dns-query"
+  fallback:
+    - "https://1.1.1.1/dns-query"
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+  proxy-server-nameserver:
+    - "https://1.1.1.1/dns-query"
+proxies: []
+proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    proxies:
+      - ♻️ 自动选择
+      - 🎯 全球直连
+  - name: ♻️ 自动选择
+    type: url-test
+    proxies: []
+    url: "https://www.gstatic.com/generate_204"
+    interval: 900
+    tolerance: 50
+    lazy: true
+  - name: ⛔️ 广告拦截
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+  - name: 🎯 全球直连
+    type: select
+    proxies:
+      - DIRECT
+  - name: 🐟 漏网之鱼
+    type: select
+    proxies:
+      - 🚀 节点选择
+      - ♻️ 自动选择
+      - 🎯 全球直连
+rule-providers:
+  reject:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/CRThu/clash-rules-mrs@release/loyalsoldier/reject.mrs"
+    path: ./ruleset/reject.mrs
+    interval: 86400
+  bm7ads:
+    type: http
+    behavior: domain
+    format: yaml
+    url: "https://cdn.jsdelivr.net/gh/blackmatrix7/ios_rule_script@master/rule/Clash/Advertising/Advertising_Domain.yaml"
+    path: ./ruleset/bm7ads.yaml
+    interval: 86400
+  icloud:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/icloud.mrs"
+    path: ./ruleset/icloud.mrs
+    interval: 86400
+  apple:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/apple.mrs"
+    path: ./ruleset/apple.mrs
+    interval: 86400
+  google:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/google.mrs"
+    path: ./ruleset/google.mrs
+    interval: 86400
+  proxy:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/CRThu/clash-rules-mrs@release/loyalsoldier/proxy.mrs"
+    path: ./ruleset/proxy.mrs
+    interval: 86400
+  direct:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/cn.mrs"
+    path: ./ruleset/direct.mrs
+    interval: 86400
+  private:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs"
+    path: ./ruleset/private.mrs
+    interval: 86400
+  gfw:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/CRThu/clash-rules-mrs@release/loyalsoldier/gfw.mrs"
+    path: ./ruleset/gfw.mrs
+    interval: 86400
+  tld-not-cn:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/tld-!cn.mrs"
+    path: ./ruleset/tld-not-cn.mrs
+    interval: 86400
+  telegramcidr:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/telegram.mrs"
+    path: ./ruleset/telegramcidr.mrs
+    interval: 86400
+  cncidr:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs"
+    path: ./ruleset/cncidr.mrs
+    interval: 86400
+  lancidr:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/private.mrs"
+    path: ./ruleset/lancidr.mrs
+    interval: 86400
+  applications:
+    type: http
+    behavior: classical
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/applications.txt"
+    path: ./ruleset/applications.yaml
+    interval: 86400
+rules:
+  - RULE-SET,applications,🎯 全球直连
+  - RULE-SET,private,🎯 全球直连
+  - RULE-SET,reject,⛔️ 广告拦截
+  - RULE-SET,bm7ads,⛔️ 广告拦截
+  - RULE-SET,icloud,🚀 节点选择
+  - RULE-SET,apple,🚀 节点选择
+  - RULE-SET,google,🚀 节点选择
+  - RULE-SET,proxy,🚀 节点选择
+  - RULE-SET,direct,🎯 全球直连
+  - RULE-SET,lancidr,🎯 全球直连
+  - RULE-SET,cncidr,🎯 全球直连
+  - RULE-SET,telegramcidr,🚀 节点选择
+  - RULE-SET,gfw,🚀 节点选择
+  - RULE-SET,tld-not-cn,🚀 节点选择
+  - GEOIP,CN,🎯 全球直连
+  - MATCH,🐟 漏网之鱼
