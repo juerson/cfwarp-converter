@@ -2,4 +2,7 @@ venv
 dist
 build
 test
-__pycache__
+scan*
+.*
+_*
+*copy*
