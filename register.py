@@ -1,3 +1,7 @@
+#!/usr/bin/env python3.11
+
+# 注意：刚注册，可能的不生效，要等一会才账户才生效！
+import argparse
 import base64
 import json
 import secrets
@@ -17,7 +21,9 @@ BASE_DIR = (
     if IS_FROZEN
     else Path(__file__).resolve().parent
 )
-(BASE_DIR / "配置文件").mkdir(exist_ok=True)
+
+DEFAULT_MASQUE_OUTPUT = BASE_DIR / "配置文件" / "masque-config.json"
+DEFAULT_WG_OUTPUT = BASE_DIR / "配置文件" / "wg-config.conf"
 
 
 class CloudflareRegistrationBase:
@@ -30,6 +36,91 @@ class CloudflareRegistrationBase:
             "Accept": "application/json",
         }
         self.timeout = 15
+
+    @staticmethod
+    def generate_wg_keypair():
+        """一次生成 WireGuard 密钥对，避免私钥 Base64 后再解码回对象算公钥。"""
+        private_obj = x25519.X25519PrivateKey.generate()
+        private_key = base64.b64encode(
+            private_obj.private_bytes(
+                serialization.Encoding.Raw,
+                serialization.PrivateFormat.Raw,
+                serialization.NoEncryption(),
+            )
+        ).decode()
+        public_key = base64.b64encode(
+            private_obj.public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw
+            )
+        ).decode()
+        return private_key, public_key
+
+    def _request(self, method, path, headers=None, **kwargs):
+        response = requests.request(
+            method,
+            f"{self.api_url}{path}",
+            headers=headers or self.headers,
+            timeout=self.timeout,
+            **kwargs,
+        )
+        if not response.ok:
+            raise requests.HTTPError(
+                f"HTTP {response.status_code}: {response.text}", response=response
+            )
+        return response
+
+    def enable_warp(self, device_id, token):
+        """新注册设备默认 warp_enabled=false，必须显式启用才能建立隧道。"""
+        headers = {**self.headers, "Authorization": f"Bearer {token}"}
+        data = self._request(
+            "PATCH", f"/reg/{device_id}", headers=headers, json={"warp_enabled": True}
+        ).json()
+        if not data.get("warp_enabled"):
+            raise ValueError("设备未能启用 WARP（warp_enabled 仍为 false）")
+        return data
+
+    @staticmethod
+    def _parse_ttl(account):
+        ttl = (account or {}).get("ttl")
+        if not ttl:
+            return None
+        try:
+            return datetime.strptime(str(ttl)[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                tzinfo=UTC
+            )
+        except ValueError:
+            return None
+
+    @classmethod
+    def ttl_local(cls, account):
+        """把 account.ttl 转成本地时间字符串，供写入配置文件。"""
+        ttl = (account or {}).get("ttl")
+        expire = cls._parse_ttl(account)
+        if expire is None:
+            return str(ttl) if ttl else ""
+        return expire.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+    @classmethod
+    def describe_ttl(cls, account):
+        """account.ttl 只在 POST /reg 响应下发，GET/PATCH 不回显，属服务端只读字段。"""
+        ttl = (account or {}).get("ttl")
+        if not ttl:
+            return "未知（接口未返回 ttl）"
+        expire = cls._parse_ttl(account)
+        if expire is None:
+            return str(ttl)
+        days = (expire - datetime.now(UTC)).days
+        return f"{ttl}（本地 {cls.ttl_local(account)}，剩余约 {days} 天）"
+
+    def write_output(self, text):
+        """写入配置前创建父目录，并备份同名旧文件，避免设备 ID/私钥被静默覆盖。"""
+        path = Path(self.output_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            backup = path.with_name(path.name + ".bak")
+            backup.write_bytes(path.read_bytes())
+            print(f"[!] 检测到已有配置文件，已备份到 {backup}")
+        path.write_text(text, encoding="utf-8")
 
     def register_device(self, public_key, tunnel_type="wireguard"):
         tos = (
@@ -46,18 +137,11 @@ class CloudflareRegistrationBase:
             "key_type": "curve25519",
             "tunnel_type": tunnel_type,
         }
-        response = requests.post(
-            f"{self.api_url}/reg",
-            headers=self.headers,
-            json=registration,
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        return response.json()
+        return self._request("POST", "/reg", json=registration).json()
 
 
 class MasqueConfigGenerator(CloudflareRegistrationBase):
-    def __init__(self, output_file=BASE_DIR / "配置文件" / "masque-config.json"):
+    def __init__(self, output_file=DEFAULT_MASQUE_OUTPUT):
         super().__init__()
         # Cloudflare 默认的 MASQUE 节点公钥 (固定值)
         self.CF_ENDPOINT_PUB_KEY = (
@@ -70,13 +154,8 @@ class MasqueConfigGenerator(CloudflareRegistrationBase):
 
     def generate_keys(self):
         """生成 WireGuard 注册用的 WG 密钥和 MASQUE 用的 P-256 密钥"""
-        # WireGuard Key
-        wg_priv_obj = x25519.X25519PrivateKey.generate()
-        wg_pub = base64.b64encode(
-            wg_priv_obj.public_key().public_bytes(
-                serialization.Encoding.Raw, serialization.PublicFormat.Raw
-            )
-        ).decode()
+        # WireGuard Key（仅取公钥用于基础注册，私钥 MASQUE 流程不需要）
+        _, wg_pub = self.generate_wg_keypair()
 
         # P-256 Key (MASQUE)
         ec_priv_obj = ec.generate_private_key(ec.SECP256R1())
@@ -98,23 +177,24 @@ class MasqueConfigGenerator(CloudflareRegistrationBase):
 
         return wg_pub, ec_pub, ec_priv
 
-    def run(self):
+    def run(self, verbose=True):
+        """verbose=False 时不打印完整配置（含私钥/Token），仅提示保存路径。"""
         wg_pub, ec_pub, ec_priv = self.generate_keys()
 
         # 1. 基础注册
         print("[*] 正在向 Cloudflare 注册新设备...")
         try:
             res1 = self.register_device(wg_pub)
-        except requests.RequestException as e:
+        except (requests.RequestException, ValueError) as e:
             print(f"[-] 注册请求失败: {e}")
-            return
+            return False
 
         try:
             device_id = res1["id"]
             token = res1["token"]
         except (ValueError, KeyError, TypeError) as e:
             print(f"[-] 注册响应格式无效: {e}")
-            return
+            return False
 
         # 2. 升级到 MASQUE
         auth_headers = {**self.headers, "Authorization": f"Bearer {token}"}
@@ -123,31 +203,28 @@ class MasqueConfigGenerator(CloudflareRegistrationBase):
             "key_type": "secp256r1",
             "tunnel_type": "masque",
             "name": f"MASQUE-{secrets.token_hex(4)}",
+            "warp_enabled": True,
         }
 
         print("[*] 正在开启 MASQUE 协议并获取 IP 分配...")
         try:
-            r2 = requests.patch(
-                f"{self.api_url}/reg/{device_id}",
-                headers=auth_headers,
-                json=enroll_data,
-                timeout=self.timeout,
-            )
-        except requests.RequestException as e:
-            print(f"[-] MASQUE 升级请求失败: {e}")
-            return
-        if r2.status_code != 200:
-            print(f"[-] 升级失败: {r2.text}")
-            return
+            res2 = self._request(
+                "PATCH", f"/reg/{device_id}", headers=auth_headers, json=enroll_data
+            ).json()
+            if not res2.get("warp_enabled"):
+                res2 = self.enable_warp(device_id, token)
+        except (requests.RequestException, ValueError) as e:
+            print(f"[-] MASQUE 升级失败: {e}")
+            return False
 
-        try:
-            res2 = r2.json()
-            # print(res2)
-            warp_plus = res2.get("account", {}).get("warp_plus", False)
-            print(f"[OK] Warp+ 账户: {warp_plus}, quota(配额): 0")
-        except ValueError as e:
-            print(f"[-] 升级响应格式无效: {e}")
-            return
+        account = res2.get("account", {})
+        warp_plus = account.get("warp_plus", False)
+        quota = account.get("quota", 0)
+        print(
+            f"[OK] WARP 已启用: {res2.get('warp_enabled')}, "
+            f"Warp+ 账户: {warp_plus}, quota(配额): {quota}"
+        )
+        print(f"[OK] 账户有效期(ttl): {self.describe_ttl(res1.get('account', {}) or account)}")
 
         try:
             peer = res2["config"]["peers"][0]
@@ -160,17 +237,20 @@ class MasqueConfigGenerator(CloudflareRegistrationBase):
                 endpoint_v6 = endpoint_v6[:-2]
         except (KeyError, IndexError, TypeError, AttributeError) as e:
             print(f"[-] 注册响应缺少有效的 MASQUE 端点: {e}")
-            return
+            return False
 
         # 3. 构造输出的格式
+        # 节点公钥优先取接口返回值（CF 轮换密钥时不会失效），硬编码值仅作兜底
+        endpoint_pub_key = peer.get("public_key") or self.CF_ENDPOINT_PUB_KEY
         config_output = {
             "private_key": ec_priv,
             "endpoint_v4": endpoint_v4,
             "endpoint_v6": endpoint_v6,
             "endpoint_h2_v4": endpoint_v4,
             "endpoint_h2_v6": endpoint_v6,
-            "endpoint_pub_key": self.CF_ENDPOINT_PUB_KEY,
-            "license": res2.get("account", {}).get("license", ""),
+            "endpoint_pub_key": endpoint_pub_key,
+            "license": account.get("license", ""),
+            "ttl": self.ttl_local(res1.get("account", {}) or account),
             "id": device_id,
             "access_token": token,
             "ipv4": res2.get("config", {})
@@ -183,31 +263,27 @@ class MasqueConfigGenerator(CloudflareRegistrationBase):
             .get("v6", ""),
         }
 
-        print("[OK] 注册成功！以下是生成的配置：\n")
-        print(json.dumps(config_output, indent=2))
+        config_text = json.dumps(config_output, indent=2)
+        try:
+            self.write_output(config_text)
+        except OSError as error:
+            print(f"[-] 写入配置失败: {error}")
+            return False
 
-        with open(self.output_file, "w", encoding="utf-8") as f:
-            json.dump(config_output, f, indent=2)
+        print("[OK] 注册成功！")
+        if verbose:
+            print("以下是生成的配置：\n")
+            print(config_text)
         print(f"\n[!] masque 配置已保存到 {self.output_file}")
+        return True
 
 
 class WireGuardConfigGenerator(CloudflareRegistrationBase):
     """注册 Cloudflare WireGuard 设备并生成标准 WireGuard 配置。"""
 
-    def __init__(self, output_file=BASE_DIR / "配置文件" / "wg-config.conf"):
+    def __init__(self, output_file=DEFAULT_WG_OUTPUT):
         super().__init__()
         self.output_file = output_file
-
-    @staticmethod
-    def generate_private_key():
-        private_key = x25519.X25519PrivateKey.generate()
-        return base64.b64encode(
-            private_key.private_bytes(
-                serialization.Encoding.Raw,
-                serialization.PrivateFormat.Raw,
-                serialization.NoEncryption(),
-            )
-        ).decode()
 
     @staticmethod
     def _with_prefix(address, prefix):
@@ -299,31 +375,44 @@ class WireGuardConfigGenerator(CloudflareRegistrationBase):
             ]
         )
 
-    def run(self):
-        private_key = self.generate_private_key()
-        private_key_obj = x25519.X25519PrivateKey.from_private_bytes(
-            base64.b64decode(private_key)
-        )
-        public_key = base64.b64encode(
-            private_key_obj.public_key().public_bytes(
-                serialization.Encoding.Raw, serialization.PublicFormat.Raw
-            )
-        ).decode()
+    def run(self, verbose=True):
+        """verbose=False 时不打印完整配置（含私钥），仅提示保存路径。"""
+        private_key, public_key = self.generate_wg_keypair()
         print("[*] 正在向 Cloudflare 注册 WireGuard 设备...")
         try:
             response_data = self.register_device(public_key)
-            # print(response_data)
-            warp_plus = response_data.get("account", {}).get("warp_plus", False)
-            print(f"[OK] Warp+ 账户: {warp_plus}, Quota(配额): 0")
+            account = response_data.get("account", {})
+            self.enable_warp(response_data["id"], response_data["token"])
+            print(
+                f"[OK] WARP 已启用: True, "
+                f"Warp+ 账户: {account.get('warp_plus', False)}, "
+                f"Quota(配额): {account.get('quota', 0)}"
+            )
+            print(f"[OK] 账户有效期(ttl): {self.describe_ttl(account)}")
             config_text = self.render_config(response_data, private_key)
+            ttl_local = self.ttl_local(account)
+            if ttl_local:
+                config_text = config_text.replace(
+                    "[Interface]",
+                    f"[Interface]\n# 账户有效期(ttl): {ttl_local}（本地时间）",
+                    1,
+                )
         except (requests.RequestException, ValueError, KeyError, TypeError) as error:
             print(f"[-] WireGuard 注册失败: {error}")
-            return
-        print("[OK] 注册成功！以下是生成的配置：\n")
-        print(config_text)
-        with open(self.output_file, "w", encoding="utf-8") as config_file:
-            config_file.write(config_text)
+            return False
+
+        print("[OK] WireGuard 注册成功！")
+        if verbose:
+            print("以下是生成的配置：\n")
+            print(config_text)
+
+        try:
+            self.write_output(config_text)
+        except OSError as error:
+            print(f"[-] 写入配置失败: {error}")
+            return False
         print(f"\n[!] WireGuard 配置已保存到 {self.output_file}")
+        return True
 
 
 def select_generator(input_func=input):
@@ -339,7 +428,10 @@ def select_generator(input_func=input):
     while True:
         try:
             choice = (
-                input_func("请选择注册的协议类型 (1: masque, 2: wireguard，q: 退出): ")
+                input_func(
+                    "请选择注册的协议类型 (1: masque, 2: wireguard，q: 退出，"
+                    "-h 查看命令行用法): "
+                )
                 .strip()
                 .lower()
             )
@@ -358,7 +450,76 @@ def select_generator(input_func=input):
         print("输入无效，请输入 1、2、masque、wireguard 或 q。")
 
 
+CANONICAL_TYPES = {
+    "masque": "masque",
+    "mq": "masque",
+    "wireguard": "wireguard",
+    "wg": "wireguard",
+}
+
+TYPE_ALIASES = {
+    "masque": (MasqueConfigGenerator, DEFAULT_MASQUE_OUTPUT),
+    "wireguard": (WireGuardConfigGenerator, DEFAULT_WG_OUTPUT),
+}
+
+
+def parse_type(value):
+    key = str(value).strip().lower()
+    if key not in CANONICAL_TYPES:
+        raise argparse.ArgumentTypeError(
+            f"不支持的协议类型 {value!r}，可选 masque、mq、wireguard、wg"
+        )
+    return CANONICAL_TYPES[key]
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=Path(sys.argv[0]).name,
+        description="注册 Cloudflare WARP 设备并生成 masque / WireGuard 配置。",
+        epilog=(
+            "不传 --type 时进入交互菜单；传 --type 时直接注册并写入文件，"
+            "适合脚本或计划任务调用。返回码 0=成功，1=失败。"
+        ),
+    )
+    parser.add_argument(
+        "--type",
+        "-t",
+        type=parse_type,
+        metavar="masque|wireguard",
+        help="协议类型（masque/mq 或 wireguard/wg），省略则进入交互菜单",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        metavar="PATH",
+        help="输出文件路径，默认 配置文件/masque-config.json 或 wg-config.conf",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="命令行模式下同时打印完整配置（默认只提示保存路径）",
+    )
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.type is None:
+        generator = select_generator()
+        if generator is None:
+            return 0
+        if args.output:
+            generator.output_file = Path(args.output)
+        return 0 if generator.run() else 1
+
+    generator_class, default_output = TYPE_ALIASES[args.type]
+    generator = generator_class(
+        output_file=Path(args.output) if args.output else default_output
+    )
+    return 0 if generator.run(verbose=args.show) else 1
+
+
 if __name__ == "__main__":
-    generator = select_generator()
-    if generator is not None:
-        generator.run()
+    sys.exit(main())
