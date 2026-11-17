@@ -1,20 +1,26 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
+
 """cfwarp-converter 命令行工具。
 
-把 Cloudflare WARP 的两种传输 (WireGuard / MASQUE) 配置，转换成第三方代理软件
+把 Cloudflare WARP 的两种传输 (WireGuard/MASQUE) 配置，转换成第三方代理软件
 可用的节点分享链接或完整配置文件。每个子命令都支持 csv/txt 两种优选 IP 数据源。
 
 子命令与协议：
     nekoray    wg → nekoray://custom# 分享链接，NekoBox (原4.0.1 - Throne 4.2.7 2024年历史版本)
     sn         wg → sn://wg? 分享链接（Android NekoBox）
-    v2rayn     wg → wireguard:// 链接（v2rayN / v2rayNG），有bug，导不入v2rayNG
-    nyamebox   wg → wg:// 链接（NyameBox / ⌈lblis NekoBox⌋ ）
+    v2rayn     wg → wireguard:// 链接（v2rayN/v2rayNG），有bug，导不入v2rayNG
+    nyamebox   wg → nekoray://wireguard# 链接（NyameBox；--amnezia 时输出 wg:// 链接）
     throne     wg/masque → Throne 分享链接，Throne新版本
-    mihomo     wg/masque → mihomo 完整配置
+    hiddify    wg/masque → Hiddify 分享链接（wg + --amnezia 输出 awg://）
     singbox    wg/masque → sing-box(-lx) 完整配置
+    mihomo     wg/masque → mihomo 完整配置
+    clashrs    wg -> clash-rs 完整配置
     server     启动本地订阅页面，网页展示 sub.txt/sub.yaml/sub.json 内容
 
---protocol 支持两位简写与全称: wg|wireguard、mq|masque。
+
+--protocol 支持两位简写与全称: wg|wireguard、mq|masque、mix|wg+masque|masque+wg
+（awg 不是独立协议：wg + --amnezia 即为 awg；mix 为对半混合：同一数据源按
+前后对半切分；不同数据源各占上限一半，短缺互补）。
 
 统一约定：
     * MTU 通过 --mtu 指定（省略则用配置文件值或协议默认值 wg=1340 / masque=1361），取值 1280~1500；
@@ -23,12 +29,13 @@
 
 用法示例：
     python main.py --help
-    python main.py throne --source csv --amnezia
-    python main.py mihomo --protocol mq --source csv --limit 30
+    python main.py throne  --source csv  --amnezia
+    python main.py hiddify --source csv --amnezia
+    python main.py mihomo  --protocol mq --source csv --limit 30
     python main.py singbox --protocol masque --source txt
     python main.py nekoray --source csv --server
     python main.py server
-    python main.py            （不带参数 = 同 server，启动本地订阅页面）
+    python main.py         （不带参数 = 同 server，启动本地订阅页面）
 """
 
 from __future__ import annotations
@@ -44,8 +51,10 @@ import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
+import openvpn
 from amnezia import (
     add_amnezia_arg,
     amnezia_config_fields,
@@ -70,6 +79,7 @@ else:
 DIR_WG_CONF = BASE_DIR / "配置文件" / "wg-config.conf"
 DIR_USQUE_CONF = BASE_DIR / "配置文件" / "masque-config.json"
 DIR_CLASH_TEMPLATE = BASE_DIR / "配置文件" / "clash.yaml"
+DIR_CLASHRS_TEMPLATE = BASE_DIR / "配置文件" / "clash-rs.yaml"
 DIR_SINGBOX_TEMPLATE = BASE_DIR / "配置文件" / "sing-box.json"
 DIR_RESULT_CSV = BASE_DIR / "result.csv"
 DIR_IP_TXT = BASE_DIR / "ip.txt"
@@ -81,12 +91,35 @@ WG_FALLBACK_ADDRESS = "172.16.0.2/32"
 # CSV（result.csv）延迟筛选阈值（ms）
 CSV_MAX_DELAY_MS = 500
 
+# 单份配置的节点总数上限（含 OpenVPN 注入），避免订阅体积与内核负担失控
+MAX_TOTAL_NODES = 150
+
+# wg 节点统一的远程 DNS 列表（mihomo/sing-box 节点用列表，v2rayN 链接用逗号串）
+WG_DNS_SERVERS = ("1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001")
+
 # 统一的协议默认 MTU：wg=1340、masque=1361
 # （仅在配置文件里没有 MTU 且未用 --mtu 指定时生效）
 DEFAULT_MTU_WG = 1340
 DEFAULT_MTU_MASQUE = 1361
 
 # AmneziaWG 常量与工具在 amnezia.py（见顶部 import）。
+
+# OpenVPN(VPN Gate) 注入：手动组与底层拨号组，名称与 配置文件/ 两个模板保持一致
+OPENVPN_AI_GROUP = "🤖 AI 专线"
+MIHOMO_AUTO_GROUP = "♻️ 自动选择"
+SINGBOX_DIAL_GROUP = "⚡自动"
+
+# AI 分流规则集（命中即走 OpenVPN 手动组）
+MIHOMO_AI_RULE_TAG = "ai-all"
+MIHOMO_AI_RULE_URL = (
+    "https://raw.githubusercontent.com/VPSDance/ai-proxy-rules/refs/heads/main/"
+    "rules/clash/all.yaml"
+)
+SINGBOX_AI_RULE_TAG = "ai-all"
+SINGBOX_AI_RULE_URL = (
+    "https://raw.githubusercontent.com/VPSDance/ai-proxy-rules/refs/heads/main/"
+    "rules/sing-box/all.json"
+)
 
 # MASQUE 节点统一的 TLS SNI
 MASQUE_SERVER_NAME = "consumer-masque.cloudflareclient.com"
@@ -98,16 +131,6 @@ CLASH_TEMPLATE_NODE_PLACEHOLDER = re.compile(
     r"^proxies:[ \t]*\[[ \t]*\][ \t]*\r?$", re.MULTILINE
 )
 SINGBOX_SELECTOR_PLACEHOLDER = "{all}"
-
-# nekoray v4.0.1 自定义节点 JSON 模板（占位符：#local_address、#MUT值、#peer_public_key、#private_key、别名、IP地址、端口）
-NEKORAY_CUSTOM_JSON_TEMPLATE = (
-    '{"_v":0,"addr":"127.0.0.1","cmd":[""],"core":"internal","cs":"{\\n  \\"interface_name\\": '
-    '\\"WARP\\",\\n  \\"local_address\\": #local_address,\\n'
-    '  \\"mtu\\": #MUT值,\\n  \\"peer_public_key\\": \\"#peer_public_key\\",\\n  \\"private_key\\":'
-    ' \\"#private_key\\",\\n  \\"server\\": \\"IP地址\\",\\n  \\"server_port\\": 端口,\\n  '
-    '\\"system_interface\\": false,\\n  \\"tag\\": \\"proxy\\",\\n  \\"type\\": \\"wireguard'
-    '\\"\\n}","mapping_port":0,"name":"别名","port":1080,"socks_port":0}'
-)
 
 
 # ============================================================================
@@ -552,17 +575,25 @@ class BaseConverter:
 
 # ---- 公共参数声明辅助 -------------------------------------------------------
 
-# --protocol 取值别名：支持两位简写与全称
-PROTOCOL_ALIASES = {"wg": "wg", "wireguard": "wg", "mq": "masque", "masque": "masque"}
+# --protocol 取值别名：支持两位简写与全称；mix 为 wg+masque 对半混合
+PROTOCOL_ALIASES = {
+    "wg": "wg",
+    "wireguard": "wg",
+    "mq": "masque",
+    "masque": "masque",
+    "mix": "mix",
+    "wg+masque": "mix",
+    "masque+wg": "mix",
+}
 
 
 def protocol_type(value: str) -> str:
-    """把 --protocol 取值归一化为内部名（wg / masque）。"""
+    """把 --protocol 取值归一化为内部名（wg / masque / mix）。"""
     key = value.strip().lower()
     if key in PROTOCOL_ALIASES:
         return PROTOCOL_ALIASES[key]
     raise argparse.ArgumentTypeError(
-        f"未知协议 {value!r}，可选：wg / wireguard / mq / masque"
+        f"未知协议 {value!r}，可选：wg / wireguard / mq / masque / mix"
     )
 
 
@@ -577,6 +608,50 @@ def add_source_args(parser: argparse.ArgumentParser, default_source: str) -> Non
     parser.add_argument(
         "--file", default=None, help="直接指定数据文件路径（覆盖 --source 的默认路径）"
     )
+    parser.add_argument(
+        "--no-ipv6",
+        action="store_true",
+        help="剔除 IPv6 优选节点（默认保留；csv / txt 数据源同样生效）",
+    )
+
+
+def add_protocol_source_args(
+    parser: argparse.ArgumentParser, with_wg: bool = True
+) -> None:
+    """mihomo/sing-box/hiddify 专用：wg 与 masque 默认读取不同数据源。"""
+    parser.add_argument(
+        "--source",
+        choices=["csv", "txt"],
+        default=None,
+        help="统一覆盖两类节点的数据源；留空时按协议默认（wg=result.csv、masque=ip.txt）",
+    )
+    parser.add_argument(
+        "--file", default=None, help="直接指定数据文件路径（覆盖 --source 的默认路径）"
+    )
+    if with_wg:
+        parser.add_argument(
+            "--with-wg",
+            type=int,
+            default=0,
+            help="masque 模式下额外追加的 WireGuard 节点数（默认：0）",
+        )
+    parser.add_argument(
+        "--no-ipv6",
+        action="store_true",
+        help="剔除 IPv6 优选节点（默认保留；csv / txt 数据源同样生效）",
+    )
+
+
+def resolve_protocol_source(args: argparse.Namespace, kind: str) -> Path:
+    """按节点类型取数据源：显式 --file/--source 优先，否则 wg=result.csv、masque=ip.txt。"""
+    if getattr(args, "file", None):
+        return Path(args.file)
+    source = getattr(args, "source", None)
+    if source == "csv":
+        return DIR_RESULT_CSV
+    if source == "txt":
+        return DIR_IP_TXT
+    return DIR_RESULT_CSV if kind == "wg" else DIR_IP_TXT
 
 
 def add_output_arg(parser: argparse.ArgumentParser, default_output: str) -> None:
@@ -590,8 +665,9 @@ def add_protocol_arg(parser: argparse.ArgumentParser, default: str = "wg") -> No
         "--protocol",
         type=protocol_type,
         default=default,
-        metavar="{wg|wireguard|mq|masque}",
-        help=f"节点协议：wg/wireguard=WireGuard，mq/masque=MASQUE（默认：{default}）",
+        metavar="{wg|wireguard|mq|masque|mix}",
+        help=f"节点协议：wg/wireguard=WireGuard，mq/masque=MASQUE，"
+        f"mix=wg+masque 对半混合（默认：{default}）",
     )
 
 
@@ -612,6 +688,92 @@ def add_limit_arg(parser: argparse.ArgumentParser, default: int | None = None) -
         default=default,
         help=f"最多生成的节点数（默认：{help_default}）",
     )
+
+
+def add_openvpn_args(parser: argparse.ArgumentParser) -> None:
+    """声明 OpenVPN(VPN Gate) 注入参数；默认全部关闭，不影响原有输出。"""
+    parser.add_argument(
+        "--with-openvpn",
+        action="store_true",
+        help="追加 VPN Gate OpenVPN 节点（默认关闭）",
+    )
+    parser.add_argument(
+        "--api-url",
+        default=openvpn.DEFAULT_API_URL,
+        help=f"VPN Gate API 地址（默认：{openvpn.DEFAULT_API_URL}）",
+    )
+    parser.add_argument(
+        "--countries",
+        default="",
+        help="只保留指定国家代码，逗号分隔，例如 JP,KR,US；为空表示全部",
+    )
+    parser.add_argument(
+        "--openvpn-limit",
+        type=int,
+        default=10,
+        help=f"写入的 OpenVPN 节点数（默认：10，上限：{openvpn.MAX_OPENVPN_NODES}）",
+    )
+    parser.add_argument(
+        "--openvpn-sort",
+        choices=["api", "score", "ping", "speed"],
+        default="api",
+        help="OpenVPN 节点排序方式（默认：api 保持接口顺序）",
+    )
+    parser.add_argument(
+        "--openvpn-proxy",
+        default=None,
+        help="抓取 VPN Gate API 的 HTTP 代理；默认自动探测本机代理，失败再直连",
+    )
+    parser.add_argument(
+        "--openvpn-group",
+        default=OPENVPN_AI_GROUP,
+        help=f"OpenVPN 手动选择组名（默认：{OPENVPN_AI_GROUP}）",
+    )
+    parser.add_argument(
+        "--openvpn-timeout",
+        type=float,
+        default=60.0,
+        help="抓取 VPN Gate 的 HTTP 超时秒数（默认：60）",
+    )
+    parser.add_argument(
+        "--openvpn-retries",
+        type=int,
+        default=3,
+        help="抓取 VPN Gate 的重试次数（默认：3）",
+    )
+
+
+def pick_endpoints(
+    endpoints: list[Endpoint], take: int, no_ipv6: bool
+) -> list[Endpoint]:
+    """按顺序取满 take 个；no_ipv6 时跳过 IPv6 继续向后补足，避免数量不足。"""
+    if not no_ipv6:
+        return endpoints[:take]
+    picked: list[Endpoint] = []
+    for ep in endpoints:
+        if ip_version(ep.host_bare) == "IPv6":
+            continue
+        picked.append(ep)
+        if len(picked) >= take:
+            break
+    return picked
+
+
+def check_node_budget(total: int) -> None:
+    """限制单份配置的节点总数，避免订阅体积与内核负担失控。"""
+    if total > MAX_TOTAL_NODES:
+        die(
+            f"节点总数 {total} 超过上限 {MAX_TOTAL_NODES}，"
+            "请调小 --limit / --with-wg / --openvpn-limit"
+        )
+
+
+def node_kind_label(args: argparse.Namespace, with_openvpn: bool) -> str:
+    """生成结果提示里的节点类型描述。"""
+    kind = {"masque": "masque", "mix": "wg+masque"}.get(args.protocol, "wg")
+    if args.protocol == "masque" and args.with_wg > 0:
+        kind = "masque+wg"
+    return f"{kind}+openvpn" if with_openvpn else kind
 
 
 def output_path_of(args: argparse.Namespace) -> Path:
@@ -677,6 +839,262 @@ def read_conf_with_fallback(profile: WgProfile) -> tuple[str, str, list[str]]:
     return private_key, public_key, addresses
 
 
+# ---- 中性节点收集与渲染（mihomo / sing-box 共用） ---------------------------
+
+
+def collect_wg_nodes(
+    args: argparse.Namespace,
+    index_offset: int = 0,
+    limit: int | None = None,
+    picked: list[Endpoint] | None = None,
+    source_total: int | None = None,
+) -> list[dict[str, Any]]:
+    """收集中性 WireGuard 节点（序号/位宽先记入 no/src_total，别名延后统一回填）。
+
+    picked / source_total 供混合模式复用已筛选的数据源切片；默认自行加载数据源。
+    """
+    profile = load_wg_profile()
+    private_key, public_key, addresses = read_conf_with_fallback(profile)
+    mtu = resolve_mtu(args.mtu, profile.mtu, DEFAULT_MTU_WG)
+    amnezia_random, amnezia_fixed = amnezia_mode(args.amnezia)
+
+    if picked is None:
+        endpoints = load_endpoints(resolve_protocol_source(args, "wg"))
+        take = args.limit if limit is None else limit
+        picked = pick_endpoints(endpoints, take, args.no_ipv6)
+        source_total = len(endpoints)
+
+    nodes = []
+    for i, ep in enumerate(picked):
+        nodes.append(
+            {
+                "kind": "wg",
+                "no": index_offset + i + 1,
+                "src_total": source_total,
+                "server": ep.host_bare,
+                "port": int(ep.port),
+                "addresses": addresses,
+                "private_key": private_key,
+                "public_key": public_key,
+                "mtu": mtu,
+                # 随机模式下每个节点独享一套参数；禁用时为 None
+                "amnezia": (
+                    generate_amnezia_params() if amnezia_random else amnezia_fixed
+                )
+                or None,
+            }
+        )
+    return nodes
+
+
+def collect_masque_nodes(
+    args: argparse.Namespace,
+    index_offset: int = 0,
+    limit: int | None = None,
+    picked: list[Endpoint] | None = None,
+    source_total: int | None = None,
+) -> list[dict[str, Any]]:
+    """收集中性 MASQUE 节点（序号/位宽先记入 no/src_total，别名延后统一回填）。"""
+    config = load_masque_config()
+    mtu = resolve_mtu(args.mtu, None, DEFAULT_MTU_MASQUE)
+
+    if picked is None:
+        endpoints = load_endpoints(resolve_protocol_source(args, "masque"))
+        take = args.limit if limit is None else limit
+        picked = pick_endpoints(endpoints, take, args.no_ipv6)
+        source_total = len(endpoints)
+
+    nodes = []
+    for i, ep in enumerate(picked, start=1):
+        nodes.append(
+            {
+                "kind": "masque",
+                "no": index_offset + i,
+                "src_total": source_total,
+                "server": ep.host_bare,
+                "port": int(ep.port),
+                "private_key": config.private_key,
+                "public_key": config.public_key,
+                "ipv4": config.ipv4,
+                "ipv6": config.ipv6,
+                "mtu": mtu,
+            }
+        )
+    return nodes
+
+
+def mixed_quotas(
+    total: int, wg_available: int, masque_available: int
+) -> tuple[int, int]:
+    """wg+masque 对半配额：各协议最多占上限一半，一方短缺时另一方补足到上限。"""
+    half = total // 2
+    wg_count = min(half, wg_available)
+    masque_count = min(total - wg_count, masque_available)
+    wg_count = min(total - masque_count, wg_available)  # masque 短缺时回补给 wg
+    return wg_count, masque_count
+
+
+def collect_mixed_nodes(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """wg + masque 对半混合：同一数据源时按前后对半切分（避免同 IP 重复两种节点）；
+    不同数据源时各占上限一半、一方短缺时另一方补足，直到上限。
+    输出 masque 在前、wg 在后，别名连续编号。"""
+    total = args.limit
+    wg_path = resolve_protocol_source(args, "wg")
+    if wg_path == resolve_protocol_source(args, "masque"):
+        pool = load_endpoints(wg_path)
+        picked = pick_endpoints(pool, total, args.no_ipv6)
+        split = len(picked) // 2
+        masque_nodes = collect_masque_nodes(
+            args, limit=split, picked=picked[:split], source_total=len(pool)
+        )
+        wg_nodes = collect_wg_nodes(
+            args,
+            index_offset=split,
+            limit=len(picked) - split,
+            picked=picked[split:],
+            source_total=len(pool),
+        )
+        nodes = masque_nodes + wg_nodes
+    else:
+        wg_nodes = collect_wg_nodes(args, limit=total)
+        masque_nodes = collect_masque_nodes(args, limit=total)
+        wg_count, masque_count = mixed_quotas(total, len(wg_nodes), len(masque_nodes))
+        nodes = masque_nodes[:masque_count] + wg_nodes[:wg_count]
+        for i, node in enumerate(nodes, start=1):
+            node["no"] = i
+    return nodes
+
+
+def collect_nodes_by_protocol(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """按协议收集中性节点；masque + --with-wg 时 wg 节点追加在 masque 之后。"""
+    if args.protocol == "mix":
+        if args.with_wg > 0:
+            die("--with-wg 只能在 --protocol masque 下使用")
+        nodes = collect_mixed_nodes(args)
+    elif args.protocol == "masque":
+        nodes = collect_masque_nodes(args)
+        if args.with_wg > 0:
+            nodes.extend(
+                collect_wg_nodes(args, index_offset=len(nodes), limit=args.with_wg)
+            )
+    else:
+        if args.with_wg > 0:
+            die("--with-wg 只能在 --protocol masque 下使用")
+        nodes = collect_wg_nodes(args)
+    # 别名统一回填：【序号】ip(port)，位宽由各自数据源总数决定
+    for node in nodes:
+        node["name"] = node_name(
+            node.pop("no"), node.pop("src_total"), node["server"], node["port"]
+        )
+    return nodes
+
+
+def fetch_openvpn_neutral(
+    args: argparse.Namespace, taken_names: set[str]
+) -> list[dict[str, Any]]:
+    """抓取 VPN Gate 中性节点；失败直接终止（CLI 报错退出，网页端转 400）。"""
+    try:
+        return openvpn.fetch_openvpn_proxies(
+            api_url=args.api_url,
+            countries=args.countries,
+            limit=args.openvpn_limit,
+            sort_mode=args.openvpn_sort,
+            proxy=args.openvpn_proxy,
+            timeout=args.openvpn_timeout,
+            retries=args.openvpn_retries,
+            taken_names=taken_names,
+        )
+    except (ValueError, RuntimeError) as error:
+        die(str(error))
+
+
+def wg_node_to_mihomo(node: dict[str, Any]) -> dict[str, Any]:
+    """中性 WireGuard 节点 → mihomo type=wireguard。"""
+    addresses = node["addresses"]
+    ipv4_str, ipv6_str = "", ""
+    if addresses:
+        ipv4_addr = addresses[0].split("/")[0]
+        ipv4_str = ipv4_addr if ip_version(ipv4_addr) == "IPv4" else "172.16.0.2"
+        if len(addresses) > 1:
+            ipv6_addr = addresses[1].split("/")[0]
+            ipv6_str = ipv6_addr if ip_version(ipv6_addr) == "IPv6" else ""
+    proxy: dict[str, Any] = {
+        "name": node["name"],
+        "type": "wireguard",
+        "server": node["server"],
+        "port": node["port"],
+        "ip": ipv4_str,
+        "ipv6": ipv6_str,
+        "private-key": node["private_key"],
+        "public-key": node["public_key"],
+        "udp": True,
+        "mtu": node["mtu"],
+        "remote-dns-resolve": True,
+        "dns": list(WG_DNS_SERVERS),
+    }
+    if node["amnezia"]:
+        proxy["amnezia-wg-option"] = amnezia_config_fields(node["amnezia"])
+    return proxy
+
+
+def masque_node_to_mihomo(node: dict[str, Any]) -> dict[str, Any]:
+    """中性 MASQUE 节点 → mihomo type=masque。"""
+    return {
+        "name": node["name"],
+        "type": "masque",
+        "server": node["server"],
+        "port": node["port"],
+        "private-key": node["private_key"],
+        "public-key": node["public_key"],
+        "ip": node["ipv4"],
+        "ipv6": node["ipv6"],
+        "mtu": node["mtu"],
+        "udp": True,
+        "remote-dns-resolve": True,
+        "dns": list(WG_DNS_SERVERS),
+    }
+
+
+def wg_node_to_singbox(node: dict[str, Any]) -> dict[str, Any]:
+    """中性 WireGuard 节点 → sing-box wireguard endpoint。"""
+    endpoint: dict[str, Any] = {
+        "type": "wireguard",
+        "tag": node["name"],
+        "mtu": node["mtu"],
+        "address": node["addresses"],
+        "private_key": node["private_key"],
+        "peers": [
+            {
+                "address": node["server"],
+                "port": node["port"],
+                "public_key": node["public_key"],
+                "allowed_ips": ["0.0.0.0/0", "::/0"],
+            }
+        ],
+    }
+    if node["amnezia"]:
+        endpoint.update(amnezia_config_fields(node["amnezia"], snake_case=True))
+    return endpoint
+
+
+def masque_node_to_singbox(node: dict[str, Any]) -> dict[str, Any]:
+    """中性 MASQUE 节点 → sing-box masque outbound。"""
+    return {
+        "type": "masque",
+        "tag": node["name"],
+        "server": node["server"],
+        "server_port": node["port"],
+        "profile": "cloudflare",
+        "vhttp": "auto",
+        "private_key": node["private_key"],
+        "public_key": node["public_key"],
+        "ip": node["ipv4"],
+        "ipv6": node["ipv6"],
+        "mtu": node["mtu"],
+        "tls": {"enabled": True, "server_name": MASQUE_SERVER_NAME},
+    }
+
+
 # ---- 批量链接类转换器 -------------------------------------------------------
 
 
@@ -693,43 +1111,60 @@ class NekorayConverter(BaseConverter):
     def run(self, args: argparse.Namespace) -> None:
         profile = load_wg_profile()
         mtu = resolve_mtu(args.mtu, profile.mtu, DEFAULT_MTU_WG)
-        base_str = self._build_base_template(profile, mtu)
+        addresses = profile.addresses or [WG_FALLBACK_ADDRESS]
+        reserved = profile.reserved_list
 
         endpoints = load_endpoints(resolve_source_path(args))
         total = len(endpoints)
         lines = []
-        for i, ep in enumerate(endpoints[: args.limit]):
+        for i, ep in enumerate(pick_endpoints(endpoints, args.limit, args.no_ipv6)):
             # 写入 JSON 的 server 需去掉 IPv6 中括号
             remarks = node_name(i + 1, total, ep.host_bare, ep.port)
-            node = (
-                base_str.replace("别名", remarks)
-                .replace("IP地址", ep.host_bare)
-                .replace("端口", ep.port)
-            )
+            bean = {
+                "_v": 0,
+                "addr": "127.0.0.1",
+                "cmd": [""],
+                "core": "internal",
+                # cs 为内嵌 sing-box wireguard outbound 的 JSON 文本（缩进 2 格）
+                "cs": json.dumps(
+                    {
+                        "interface_name": "WARP",
+                        # Address 有多个值（一般 IPv4 CIDR + IPv6 CIDR）与单个值的格式不同
+                        "local_address": (
+                            addresses[0] if len(addresses) == 1 else list(addresses)
+                        ),
+                        "mtu": int(mtu),
+                        "peer_public_key": (profile.public_key or "").strip(),
+                        "private_key": (profile.private_key or "").strip(),
+                        "reserved": reserved,
+                        "server": ep.host_bare,
+                        "server_port": int(ep.port),
+                        "system_interface": False,
+                        "tag": "proxy",
+                        "type": "wireguard",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "mapping_port": 0,
+                "name": remarks,
+                "port": 1080,
+                "socks_port": 0,
+            }
             lines.append(
                 "nekoray://custom#"
-                + base64.b64encode(node.encode(), altchars=b"-_").decode()
+                + base64.b64encode(
+                    json.dumps(
+                        bean,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode(),
+                    altchars=b"-_",
+                ).decode()
             )
         save_links(args, lines, "nekoray")
-
-    @staticmethod
-    def _build_base_template(profile: WgProfile, mtu: int) -> str:
-        addresses = profile.addresses or [WG_FALLBACK_ADDRESS]
-        # Address 有多个值（一般 IPv4 CIDR + IPv6 CIDR）与单个值的格式不同
-        if len(addresses) > 1:
-            local_address = (
-                r"[\n" + ",".join(rf"    \"{item}\"" for item in addresses) + r"\n  ]"
-            )
-        else:
-            local_address = rf"\"{addresses[0]}\""
-        peer_public_key = (profile.public_key or "").strip()
-        private_key = (profile.private_key or "").strip()
-        return (
-            NEKORAY_CUSTOM_JSON_TEMPLATE.replace("#peer_public_key", peer_public_key)
-            .replace("#private_key", private_key)
-            .replace("#local_address", local_address)
-            .replace("#MUT值", str(mtu))
-        )
 
 
 @register_converter(
@@ -751,7 +1186,7 @@ class SnLinkConverter(BaseConverter):
         endpoints = load_endpoints(resolve_source_path(args))
         total = len(endpoints)
         results = []
-        for i, ep in enumerate(endpoints[: args.limit]):
+        for i, ep in enumerate(pick_endpoints(endpoints, args.limit, args.no_ipv6)):
             try:
                 # SN 链接的名称不支持中文，用 [01] 隔离序号
                 name = node_name(i + 1, total, ep.host_bare, ep.port, ascii_only=True)
@@ -784,12 +1219,27 @@ class ThroneConverter(BaseConverter):
         add_amnezia_arg(parser)
 
     def run(self, args: argparse.Namespace) -> None:
-        if args.protocol == "masque":
+        if args.protocol == "mix":
+            self._run_mix(args)
+        elif args.protocol == "masque":
             self._run_masque(args)
         else:
             self._run_wg(args)
 
     def _run_wg(self, args: argparse.Namespace) -> None:
+        save_links(args, self._wg_lines(args), "Throne(wg)")
+
+    def _wg_lines(
+        self,
+        args: argparse.Namespace,
+        picked: list[Endpoint] | None = None,
+        source_total: int | None = None,
+        name_offset: int = 0,
+    ) -> list[str]:
+        """生成 wg:// 分享链接；picked/source_total 供混合模式复用数据源切片。
+
+        注意：序号用 i+1（从【02】开始），混合模式用 name_offset 校正衔接。
+        """
         profile = load_wg_profile()
         private_key = profile.private_key
         public_key = profile.public_key or WG_FALLBACK_PUBLIC_KEY
@@ -798,11 +1248,15 @@ class ThroneConverter(BaseConverter):
         reserved = "-".join(map(str, profile.reserved_list))
         amnezia_random, amnezia_fixed = amnezia_mode(args.amnezia)
 
-        endpoints = load_endpoints(resolve_source_path(args))
-        total = len(endpoints)
+        if picked is None:
+            endpoints = load_endpoints(resolve_source_path(args))
+            picked = pick_endpoints(endpoints, args.limit, args.no_ipv6)
+            source_total = len(endpoints)
         lines = []
-        for i, ep in enumerate(endpoints[: args.limit], start=1):
-            remarks = node_name(i + 1, total, ep.host_bare, ep.port)
+        for i, ep in enumerate(picked, start=1):
+            remarks = node_name(
+                i + 1 + name_offset, source_total, ep.host_bare, ep.port
+            )
             # 每写一个节点就随机一次：随机模式下该节点独享一套参数
             params = generate_amnezia_params() if amnezia_random else amnezia_fixed
             amnezia = ""
@@ -818,16 +1272,30 @@ class ThroneConverter(BaseConverter):
                 f"&local_address={'-'.join(addresses)}{amnezia}"
                 f"#{quote(remarks)}"
             )
-        save_links(args, lines, "Throne(wg)")
+        return lines
 
     def _run_masque(self, args: argparse.Namespace) -> None:
+        save_links(
+            args, self._masque_lines(args), "Throne(masque)", trailing_newline=False
+        )
+
+    def _masque_lines(
+        self,
+        args: argparse.Namespace,
+        picked: list[Endpoint] | None = None,
+        source_total: int | None = None,
+    ) -> list[str]:
+        """生成 masque 的 throne://add 分享链接；picked 供混合模式复用数据源切片。"""
         config = load_masque_config()
         mtu = resolve_mtu(args.mtu, None, DEFAULT_MTU_MASQUE)
-        endpoints = load_endpoints(resolve_source_path(args))
+        if picked is None:
+            endpoints = load_endpoints(resolve_source_path(args))
+            picked = pick_endpoints(endpoints, args.limit, args.no_ipv6)
+            source_total = len(endpoints)
         links = []
-        for i, ep in enumerate(endpoints[: args.limit], start=1):
+        for i, ep in enumerate(picked, start=1):
             ip, port = ep.host_bare, int(ep.port)
-            name = node_name(i, len(endpoints), ip, port)
+            name = node_name(i, source_total, ip, port)
             data = {
                 "address": [f"{config.ipv4}/32", f"{config.ipv6}/128"],
                 "mtu": mtu,
@@ -845,12 +1313,191 @@ class ThroneConverter(BaseConverter):
                     json.dumps(data, ensure_ascii=False).encode(), altchars=b"-_"
                 ).decode()
             )
-        save_links(args, links, "Throne(masque)", trailing_newline=False)
+        return links
+
+    def _run_mix(self, args: argparse.Namespace) -> None:
+        """wg + masque 对半混合：同一数据源按前后对半切分，masque 在前、wg 在后。"""
+        endpoints = load_endpoints(resolve_source_path(args))
+        picked = pick_endpoints(endpoints, args.limit, args.no_ipv6)
+        split = len(picked) // 2
+        lines = self._masque_lines(
+            args, picked=picked[:split], source_total=len(endpoints)
+        ) + self._wg_lines(
+            args,
+            picked=picked[split:],
+            source_total=len(endpoints),
+            name_offset=split - 1,
+        )
+        save_links(args, lines, "Throne(wg+masque)")
+
+
+@register_converter(
+    "hiddify",
+    "wg/masque → Hiddify 分享链接（wg + --amnezia 输出 awg://）",
+    default_output="sub.txt",
+)
+class HiddifyConverter(BaseConverter):
+    """Hiddify（hiddify/ray2sing 解析器）链接：
+
+    - wg → wg://，地址用 ip= 逗号分隔（IPv4 + 额外 IPv6 都是列表）
+    - wg + --amnezia → awg:// + AmneziaWG 混淆（不带值=每节点随机）
+    - masque → masque://，addr/addr6 分别对应设备 IPv4/IPv6，端点用 endpoint/endpoint6
+    - mix → masque 前半 + 后半按 --amnezia 选 wg 或 awg，各取上限一半，短缺互补
+    """
+
+    def fill_parser(self, parser: argparse.ArgumentParser) -> None:
+        add_protocol_source_args(parser, with_wg=False)
+        add_output_arg(parser, self.default_output)
+        add_protocol_arg(parser)
+        add_mtu_arg(parser)
+        add_limit_arg(parser, 50)
+        add_amnezia_arg(parser)
+
+    def run(self, args: argparse.Namespace) -> None:
+        if args.protocol == "mix":
+            self._run_mix(args)
+        elif args.protocol == "masque":
+            save_links(args, self._masque_lines(args), "Hiddify(masque)")
+        else:
+            amnezia_random, amnezia_fixed = amnezia_mode(args.amnezia)
+            scheme = "awg" if (amnezia_random or amnezia_fixed) else "wg"
+            save_links(args, self._wg_lines(args), f"Hiddify({scheme})")
+
+    def _wg_lines(
+        self,
+        args: argparse.Namespace,
+        picked: list[Endpoint] | None = None,
+        source_total: int | None = None,
+        name_offset: int = 0,
+    ) -> list[str]:
+        """生成 wg:// 链接；--amnezia 启用时改为 awg:// + 混淆参数。"""
+        profile, private_key, public_key, addresses = load_wg_bundle()
+        mtu = resolve_mtu(args.mtu, profile.mtu, DEFAULT_MTU_WG)
+        reserved = profile.reserved_list
+        # hiddify 对 reserved 逐项 ParseUint，空值或非 3 字节会让整条链接解析失败
+        reserved_param = (
+            f"&reserved={','.join(map(str, reserved))}"
+            if len(reserved) == 3 and all(0 <= value <= 255 for value in reserved)
+            else ""
+        )
+        local_address = quote(",".join(addresses), safe=",:")
+        amnezia_random, amnezia_fixed = amnezia_mode(args.amnezia)
+        scheme = "awg" if (amnezia_random or amnezia_fixed) else "wg"
+
+        if picked is None:
+            endpoints = load_endpoints(resolve_protocol_source(args, "wg"))
+            picked = pick_endpoints(endpoints, args.limit, args.no_ipv6)
+            source_total = len(endpoints)
+        lines = []
+        for i, ep in enumerate(picked, start=1):
+            remarks = node_name(i + name_offset, source_total, ep.host_bare, ep.port)
+            params = generate_amnezia_params() if amnezia_random else amnezia_fixed
+            # i1/i2 是 AmneziaWG 标签语法（含 <、空格、>），必须 URL 编码
+            amnezia = "".join(
+                f"&{key}={quote(str(val), safe='')}" for key, val in params.items()
+            )
+            """ 该链接是 endpoints: type=wireguard + noise.fake_packet 写法"""
+            lines.append(
+                f"{scheme}://{ep.host}:{ep.port}?private_key={quote(private_key, safe='')}"
+                f"&peer_public_key={quote(public_key, safe='')}&ip={local_address}"
+                f"{reserved_param}&mtu={mtu}&keepalive=25{amnezia}"
+                f"#{quote(remarks)}"
+            )
+            """ 该链接是 endpoints: type=awg + awg.jc/jmin 写法 """
+            # ---- 可选：AWG 3.x 写法（整段取消注释即可切换，上方写法保持不动） ----
+            # awg3_extra = ""
+            # if amnezia:
+            #     awg3_extra = (
+            #         "&header_protection_key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%3D"
+            #         "&content_padding_addition=1-10"
+            #         "&rekey_after_time=60-120"
+            #         "&rekey_timeout=5-10"
+            #         "&max_handshake_attempts=10"
+            #     )
+            # lines.append(
+            #     f"{scheme}://{ep.host}:{ep.port}?private_key={quote(private_key, safe='')}"
+            #     f"&peer_public_key={quote(public_key, safe='')}&ip={local_address}"
+            #     f"{reserved_param}&mtu={mtu}&keepalive=25{amnezia}{awg3_extra}"
+            #     f"#AWG3-{quote(remarks)}"
+            # )
+        return lines
+
+    def _masque_lines(
+        self,
+        args: argparse.Namespace,
+        picked: list[Endpoint] | None = None,
+        source_total: int | None = None,
+        name_offset: int = 0,
+    ) -> list[str]:
+        """生成 masque:// 链接：addr 只放 IPv4，额外 IPv6 走 addr6（单值，裸地址）。"""
+        config = load_masque_config()
+        mtu = resolve_mtu(args.mtu, None, DEFAULT_MTU_MASQUE)
+        # masque 的 key/peer 不走 linkKey() 还原，未编码的 "+" 会被解成空格而损坏密钥
+        key = quote(config.private_key, safe="/=")
+        peer = quote(config.public_key, safe="/=")
+        addr6 = f"&addr6={config.ipv6}" if config.ipv6 else ""
+
+        if picked is None:
+            endpoints = load_endpoints(resolve_protocol_source(args, "masque"))
+            picked = pick_endpoints(endpoints, args.limit, args.no_ipv6)
+            source_total = len(endpoints)
+        lines = []
+        for i, ep in enumerate(picked, start=1):
+            remarks = node_name(i + name_offset, source_total, ep.host_bare, ep.port)
+            endpoint_key = (
+                "endpoint6" if ip_version(ep.host_bare) == "IPv6" else "endpoint"
+            )
+            lines.append(
+                f"masque://?key={key}&peer={peer}&addr={config.ipv4}{addr6}"
+                f"&{endpoint_key}={ep.host}:{ep.port}&transport=auto"
+                f"&sni={MASQUE_SERVER_NAME}&mtu={mtu}#{quote(remarks)}"
+            )
+        return lines
+
+    def _run_mix(self, args: argparse.Namespace) -> None:
+        """masque 用 ip.txt、后半用 result.csv：各占上限一半，短缺时另一方补足；
+        后半是 wg 还是 awg 由 --amnezia 决定。"""
+        total = args.limit
+        masque_endpoints = load_endpoints(resolve_protocol_source(args, "masque"))
+        masque_picked = pick_endpoints(masque_endpoints, total // 2, args.no_ipv6)
+        wg_endpoints = load_endpoints(resolve_protocol_source(args, "wg"))
+        wg_picked = pick_endpoints(
+            wg_endpoints, total - len(masque_picked), args.no_ipv6
+        )
+        lines = self._masque_lines(
+            args, picked=masque_picked, source_total=total
+        ) + self._wg_lines(
+            args,
+            picked=wg_picked,
+            source_total=total,
+            name_offset=len(masque_picked),
+        )
+        amnezia_random, amnezia_fixed = amnezia_mode(args.amnezia)
+        kind = "awg+masque" if (amnezia_random or amnezia_fixed) else "wg+masque"
+        save_links(args, lines, f"Hiddify({kind})")
+
+
+# NymBox wg:// 链接的 Amnezia 参数键：内部短键 → 链接长键名
+_NYMBOX_AMNEZIA_FIELDS = (
+    ("jc", "junk_packet_count", None),
+    ("jmin", "junk_packet_min_size", None),
+    ("jmax", "junk_packet_max_size", None),
+    ("s1", "init_packet_junk_size", "0"),
+    ("s2", "response_packet_junk_size", "0"),
+    ("s3", "underload_packet_junk_size", "0"),
+    ("s4", "transport_packet_junk_size", "0"),
+    ("h1", "init_packet_magic_header", None),
+    ("h2", "response_packet_magic_header", None),
+    ("h3", "cookie_reply_magic_header", None),
+    ("h4", "transport_packet_magic_header", None),
+    ("i1", "i1", None),
+    ("i2", "i2", None),
+)
 
 
 @register_converter(
     "nyamebox",
-    "wg → wg:// 分享链接（NyameBox / NekoBox）",
+    "wg → nekoray://wireguard# 分享链接（NyameBox；--amnezia 时输出 wg:// 链接）",
     default_output="sub.txt",
 )
 class NyameBoxConverter(BaseConverter):
@@ -859,6 +1506,7 @@ class NyameBoxConverter(BaseConverter):
         add_output_arg(parser, self.default_output)
         add_mtu_arg(parser)
         add_limit_arg(parser, 500)
+        add_amnezia_arg(parser)
 
     def run(self, args: argparse.Namespace) -> None:
         profile = load_wg_profile()
@@ -866,19 +1514,86 @@ class NyameBoxConverter(BaseConverter):
         public_key = profile.public_key or WG_FALLBACK_PUBLIC_KEY
         addresses = profile.addresses or [WG_FALLBACK_ADDRESS]
         mtu = resolve_mtu(args.mtu, profile.mtu, DEFAULT_MTU_WG)
+        reserved = "-".join(map(str, profile.reserved_list))
+        amnezia_random, amnezia_fixed = amnezia_mode(args.amnezia)
 
         endpoints = load_endpoints(resolve_source_path(args))
         total = len(endpoints)
         lines = []
-        for i, ep in enumerate(endpoints[: args.limit]):
+        for i, ep in enumerate(pick_endpoints(endpoints, args.limit, args.no_ipv6)):
             remarks = node_name(i + 1, total, ep.host_bare, ep.port)
-            lines.append(
-                f"wg://{ep.host}:{ep.port}?private_key={quote(private_key)}"
-                f"&peer_public_key={quote(public_key)}"
-                f"&persistent_keepalive=0&mtu={quote(str(mtu))}"
-                f"&use_system_interface=false"
-                f"&local_address={'-'.join(addresses)}#{quote(remarks)}"
-            )
+            # 每写一个节点就随机一次：随机模式下该节点独享一套参数
+            params = generate_amnezia_params() if amnezia_random else amnezia_fixed
+            if params:
+                # --amnezia 分支：wg:// 长键名格式（保持不变）。S 参数缺失时硬编码 0；
+                # i1/i2 是 AmneziaWG 标签语法（含 <、空格、>），wg:// 里需 URL 编码
+                fields = []
+                for short, name, fill in _NYMBOX_AMNEZIA_FIELDS:
+                    val = params.get(short, fill)
+                    if val is not None:
+                        fields.append(f"&{name}={quote(str(val), safe='')}")
+                amnezia = "&enable_amnezia=true" + "".join(fields)
+                # NymBox 导出格式里 base64 的 +// 、节点名的 (): 均不转码（仅 = 等转码）
+                lines.append(
+                    f"wg://{ep.host}:{ep.port}?private_key={quote(private_key, safe='+/')}"
+                    f"&peer_public_key={quote(public_key, safe='+/')}"
+                    f"&reserved={reserved}"
+                    f"&persistent_keepalive=0&mtu={quote(str(mtu))}"
+                    f"&use_system_interface={'true' if amnezia else 'false'}"
+                    f"&local_address={'-'.join(addresses)}{amnezia}"
+                    f"#{quote(remarks, safe='():')}"
+                )
+            else:
+                # 不启用混淆：NyameBox（NekoBox for PC）原生分享格式
+                # nekoray://wireguard#<base64(bean JSON)>，按 App 导出的示例 bean 构造：
+                # 紧凑无空格、键名字母序、非 ASCII 原样 UTF-8、标准 base64 带 = padding
+                bean = {
+                    "_v": 0,
+                    "addr": ep.host_bare,
+                    "brutal_speed": 0,
+                    "c_cfg": "",
+                    "c_out": "",
+                    "enable_amnezia": False,
+                    "enable_brutal": False,
+                    "h1": "",
+                    "h2": "",
+                    "h3": "",
+                    "h4": "",
+                    "i1": "",
+                    "i2": "",
+                    "i3": "",
+                    "i4": "",
+                    "i5": "",
+                    "jc": 0,
+                    "jmax": 0,
+                    "jmin": 0,
+                    "local_address": list(addresses),
+                    "mtu": int(mtu),
+                    "mux": 0,
+                    "name": remarks,
+                    "persistent_keepalive": 0,
+                    "port": int(ep.port),
+                    "pre_shared_key": "",
+                    "private_key": private_key,
+                    "public_key": public_key,
+                    "reserved": profile.reserved_list,
+                    "s1": 0,
+                    "s2": 0,
+                    "s3": 0,
+                    "s4": 0,
+                    "use_system_proxy": False,
+                }
+                lines.append(
+                    "nekoray://wireguard#"
+                    + base64.b64encode(
+                        json.dumps(
+                            bean,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ).encode()
+                    ).decode()
+                )
         save_links(args, lines, "NyameBox")
 
 
@@ -909,14 +1624,14 @@ class V2rayNConverter(BaseConverter):
         endpoints = load_endpoints(resolve_source_path(args))
         total = len(endpoints)
         lines = []
-        for i, ep in enumerate(endpoints[: args.limit]):
+        for i, ep in enumerate(pick_endpoints(endpoints, args.limit, args.no_ipv6)):
             remarks = node_name(i + 1, total, ep.host_bare, ep.port)
             lines.append(
                 f"wireguard://{quote(private_key, safe='')}@{ep.host}:{ep.port}?"
-                f"&address={quote(addr, safe='')}&presharedkey="
+                f"address={quote(addr, safe='')}&presharedkey="
                 f"&reserved={quote(reserved, safe='')}"
                 f"&publickey={quote(public_key, safe='')}"
-                f"&dns={quote('1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001', safe='')}"
+                f"&dns={quote(','.join(WG_DNS_SERVERS), safe='')}"
                 f"&mtu={mtu}"
                 f"#{quote(remarks, safe='')}"
             )
@@ -936,6 +1651,220 @@ def build_clash_config(proxy_lines: list[str]) -> str:
     return CLASH_TEMPLATE_NODE_PLACEHOLDER.sub(lambda _: replacement, template, count=1)
 
 
+def _split_eol(text: str) -> tuple[list[str], str]:
+    eol = "\r\n" if "\r\n" in text else "\n"
+    return text.split(eol), eol
+
+
+def _top_section(lines: list[str], header: str) -> tuple[int, int]:
+    """返回顶层 header 块的 [start, end)，end 是下一个顶层 key。"""
+    start = -1
+    for i, line in enumerate(lines):
+        if re.match(rf"^{re.escape(header)}\s*:", line):
+            start = i
+            break
+    if start < 0:
+        raise RuntimeError(f"配置里找不到顶层块：{header}")
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if not line.strip() or line.startswith("#"):
+            continue
+        if not line[0].isspace():
+            end = i
+            break
+    return start, end
+
+
+def _proxy_group_blocks(lines: list[str], start: int, end: int) -> dict[str, dict]:
+    """把 proxy-groups 拆成 name -> {start, end}。"""
+    starts: list[tuple[int, str]] = []
+    for i in range(start + 1, end):
+        match = re.match(r"^  - name\s*:\s*(.+?)\s*$", lines[i])
+        if match:
+            starts.append((i, match.group(1).strip().strip("\"'")))
+    blocks: dict[str, dict] = {}
+    for index, (line_no, name) in enumerate(starts):
+        stop = starts[index + 1][0] if index + 1 < len(starts) else end
+        blocks[name] = {"start": line_no, "end": stop}
+    return blocks
+
+
+def _append_member_to_block(block_lines: list[str], member: str) -> list[str]:
+    """在单个组块内把成员追加到 proxies 列表末尾。"""
+    out = list(block_lines)
+    for i, line in enumerate(out):
+        if not re.match(r"^\s+proxies\s*:\s*$", line):
+            continue
+        indent = len(line) - len(line.lstrip())
+        prefix = " " * (indent + 2) + "- "
+        last = i
+        for j in range(i + 1, len(out)):
+            if out[j].startswith(prefix):
+                last = j
+            elif out[j].strip():
+                break
+        out.insert(last + 1, prefix + member)
+        break
+    return out
+
+
+def _ensure_group_field(block_lines: list[str], key: str, value: str) -> list[str]:
+    """确保组块带指定字段（如 exclude-type / exclude-filter）。"""
+    out = list(block_lines)
+    for i, line in enumerate(out):
+        if re.match(rf"^\s+{re.escape(key)}\s*:", line):
+            indent = line[: len(line) - len(line.lstrip())]
+            out[i] = f"{indent}{key}: {value}"
+            return out
+    for i, line in enumerate(out):
+        if re.match(r"^\s+type\s*:", line):
+            indent = line[: len(line) - len(line.lstrip())]
+            out.insert(i + 1, f"{indent}{key}: {value}")
+            return out
+    return out
+
+
+def inject_mihomo_openvpn(
+    config_text: str,
+    openvpn_names: list[str],
+    group: str = OPENVPN_AI_GROUP,
+    dial_group: str = MIHOMO_AUTO_GROUP,
+    auto_group: str = MIHOMO_AUTO_GROUP,
+    main_group: str = "🚀 节点选择",
+    final_group: str = "🐟 漏网之鱼",
+    direct_group: str = "🎯 全球直连",
+) -> str:
+    """插入 AI 手动组，并让自动选择组排除 openvpn 与 AI 组自身。"""
+    if not openvpn_names:
+        return config_text
+    lines, eol = _split_eol(config_text)
+    start, end = _top_section(lines, "proxy-groups")
+    blocks = _proxy_group_blocks(lines, start, end)
+
+    rebuilt: list[str] = []
+    for name, block in blocks.items():
+        group_lines = lines[block["start"] : block["end"]]
+        if name == auto_group:
+            group_lines = _ensure_group_field(group_lines, "exclude-type", '"openvpn"')
+            group_lines = _ensure_group_field(
+                group_lines, "exclude-filter", f'"{group}"'
+            )
+        elif name in (main_group, final_group):
+            group_lines = _append_member_to_block(group_lines, group)
+        rebuilt.extend(group_lines)
+
+    rebuilt.extend(
+        [
+            "",
+            f"  - name: {group}",
+            "    type: select",
+            "    proxies:",
+            *[f"      - {name}" for name in openvpn_names],
+            f"      - {dial_group}",
+            f"      - {direct_group}",
+        ]
+    )
+
+    new_lines = lines[: start + 1] + rebuilt + lines[end:]
+    return inject_mihomo_ai_rules(eol.join(new_lines), group)
+
+
+def inject_mihomo_ai_rules(config_text: str, group: str) -> str:
+    """插入 AI 规则集 provider 与 RULE-SET 规则，命中走 OpenVPN 手动组。"""
+    lines, eol = _split_eol(config_text)
+
+    start, end = _top_section(lines, "rule-providers")
+    has_provider = any(
+        re.match(rf"^\s+{re.escape(MIHOMO_AI_RULE_TAG)}\s*:", line)
+        for line in lines[start:end]
+    )
+    if not has_provider:
+        provider = [
+            f"  {MIHOMO_AI_RULE_TAG}:",
+            "    type: http",
+            "    behavior: classical",
+            "    format: yaml",
+            f'    url: "{MIHOMO_AI_RULE_URL}"',
+            f"    path: ./ruleset/{MIHOMO_AI_RULE_TAG}.yaml",
+            "    interval: 86400",
+        ]
+        lines[end:end] = provider
+
+    start, end = _top_section(lines, "rules")
+    rule_text = f"RULE-SET,{MIHOMO_AI_RULE_TAG},{group}"
+    if not any(line.strip() == f"- {rule_text}" for line in lines[start:end]):
+        insert_at = start + 1
+        for i in range(start + 1, end):
+            if "bm7ads" in lines[i]:
+                insert_at = i + 1
+        lines.insert(insert_at, f"  - {rule_text}")
+
+    return eol.join(lines)
+
+
+def inject_singbox_openvpn(
+    config: dict,
+    openvpn_endpoints: list[dict],
+    group: str = OPENVPN_AI_GROUP,
+    dial_group: str = SINGBOX_DIAL_GROUP,
+    main_group: str = "🚀代理",
+) -> None:
+    """在 sing-box 配置里追加 openvpn-client endpoint 与手动选择组。"""
+    if not openvpn_endpoints:
+        return
+    endpoints = config.setdefault("endpoints", [])
+    endpoints.extend(openvpn_endpoints)
+
+    outbounds = config.setdefault("outbounds", [])
+    tags = {item.get("tag") for item in outbounds} | {
+        item.get("tag") for item in endpoints
+    }
+    if group not in tags:
+        outbounds.append(
+            {
+                "type": "selector",
+                "tag": group,
+                "outbounds": [item["tag"] for item in openvpn_endpoints]
+                + [dial_group, "DIRECT"],
+                "default": openvpn_endpoints[0]["tag"],
+            }
+        )
+
+    for item in outbounds:
+        if item.get("tag") != main_group:
+            continue
+        children = item.setdefault("outbounds", [])
+        if group not in children:
+            children.append(group)
+        break
+
+    route = config.setdefault("route", {})
+    rule_sets = route.setdefault("rule_set", [])
+    if not any(item.get("tag") == SINGBOX_AI_RULE_TAG for item in rule_sets):
+        rule_sets.append(
+            {
+                "type": "remote",
+                "tag": SINGBOX_AI_RULE_TAG,
+                "url": SINGBOX_AI_RULE_URL,
+                "http_client": "ruleset-download",
+                "update_interval": "24h",
+            }
+        )
+
+    rules = route.setdefault("rules", [])
+    if not any(
+        isinstance(item, dict) and item.get("rule_set") == SINGBOX_AI_RULE_TAG
+        for item in rules
+    ):
+        insert_at = len(rules)
+        for i, item in enumerate(rules):
+            if isinstance(item, dict) and item.get("rule_set") == "geosite-cn":
+                insert_at = i
+                break
+        rules.insert(insert_at, {"rule_set": SINGBOX_AI_RULE_TAG, "outbound": group})
+
+
 @register_converter(
     "mihomo",
     "wg/masque → mihomo(clash.meta) 完整配置",
@@ -943,109 +1872,159 @@ def build_clash_config(proxy_lines: list[str]) -> str:
 )
 class MihomoConverter(BaseConverter):
     def fill_parser(self, parser: argparse.ArgumentParser) -> None:
-        add_source_args(parser, self.default_source)
+        add_protocol_source_args(parser)
         add_output_arg(parser, self.default_output)
         add_protocol_arg(parser)
         add_mtu_arg(parser)
         add_limit_arg(parser, 80)
         add_amnezia_arg(parser)
+        add_openvpn_args(parser)
 
     def run(self, args: argparse.Namespace) -> None:
-        if args.protocol == "masque":
-            self._run_masque(args)
-        else:
-            self._run_wg(args)
+        neutral = collect_nodes_by_protocol(args)
+        nodes = [
+            wg_node_to_mihomo(node)
+            if node["kind"] == "wg"
+            else masque_node_to_mihomo(node)
+            for node in neutral
+        ]
+        names = [str(node["name"]) for node in nodes]
 
-    def _run_wg(self, args: argparse.Namespace) -> None:
-        profile = load_wg_profile()
-        private_key, public_key, addresses = read_conf_with_fallback(profile)
-        mtu = resolve_mtu(args.mtu, profile.mtu, DEFAULT_MTU_WG)
-        amnezia_random, amnezia_fixed = amnezia_mode(args.amnezia)
+        openvpn_nodes: list[dict] = []
+        if args.with_openvpn:
+            openvpn_nodes = [
+                openvpn.to_mihomo_proxy(node)
+                for node in fetch_openvpn_neutral(args, set(names))
+            ]
+            for node in openvpn_nodes:
+                node["dialer-proxy"] = MIHOMO_AUTO_GROUP
+            nodes.extend(openvpn_nodes)
 
-        # mihomo 的 wireguard 节点需拆分 IPv4 / IPv6 地址
-        ipv4_str, ipv6_str = "", ""
-        if addresses:
-            ipv4_addr = addresses[0].split("/")[0]
-            ipv4_str = ipv4_addr if ip_version(ipv4_addr) == "IPv4" else "172.16.0.2"
-            if len(addresses) > 1:
-                ipv6_addr = addresses[1].split("/")[0]
-                ipv6_str = ipv6_addr if ip_version(ipv6_addr) == "IPv6" else ""
-
-        endpoints = load_endpoints(resolve_source_path(args))
-
-        proxy_lines = []
-        for i, ep in enumerate(endpoints[: args.limit]):
-            proxy_name = node_name(i + 1, len(endpoints), ep.host_bare, ep.port)
-            node = {
-                "name": proxy_name,
-                "type": "wireguard",
-                "server": ep.host_bare,
-                "port": int(ep.port),
-                "ip": ipv4_str,
-                "ipv6": ipv6_str,
-                "private-key": private_key,
-                "public-key": public_key,
-                # "reserved": "",
-                "udp": True,
-                "mtu": mtu,
-                "remote-dns-resolve": True,
-                "dns": [
-                    "1.1.1.1",
-                    "1.0.0.1",
-                    "2606:4700:4700::1111",
-                    "2606:4700:4700::1001",
-                ],
-            }
-            params = generate_amnezia_params() if amnezia_random else amnezia_fixed
-            if params:
-                node["amnezia-wg-option"] = amnezia_config_fields(params)
-            proxy_lines.append(f"  - {json.dumps(node, ensure_ascii=False)}")
-
-
+        check_node_budget(len(nodes))
+        proxy_lines = [f"  - {json.dumps(node, ensure_ascii=False)}" for node in nodes]
+        config_text = build_clash_config(proxy_lines)
+        if openvpn_nodes:
+            config_text = inject_mihomo_openvpn(
+                config_text,
+                [str(node["name"]) for node in openvpn_nodes],
+                group=args.openvpn_group,
+            )
         save_config(
             args,
-            build_clash_config(proxy_lines),
-            len(proxy_lines),
-            "wg",
-            default_name="sub.yaml",
+            config_text,
+            len(nodes),
+            node_kind_label(args, bool(openvpn_nodes)),
         )
 
-    def _run_masque(self, args: argparse.Namespace) -> None:
-        config = load_masque_config()
-        mtu = resolve_mtu(args.mtu, None, DEFAULT_MTU_MASQUE)
-        endpoints = load_endpoints(resolve_source_path(args))
-        proxy_lines = []
-        for i, ep in enumerate(endpoints[: args.limit], start=1):
-            ip, port = ep.host_bare, int(ep.port)
-            name = node_name(i, len(endpoints), ip, port)
-            node = {
-                "name": name,
-                "type": "masque",
-                "server": ip,
-                "port": port,
-                "private-key": config.private_key,
-                "public-key": config.public_key,
-                "ip": config.ipv4,
-                "ipv6": config.ipv6,
-                "mtu": mtu,
-                "udp": True,
-                "remote-dns-resolve": True,
-                "dns": [
-                    "1.1.1.1",
-                    "1.0.0.1",
-                    "2606:4700:4700::1111",
-                    "2606:4700:4700::1001",
-                ],
-            }
-            proxy_lines.append(f"  - {json.dumps(node, ensure_ascii=False)}")
 
-        save_config(
-            args,
-            build_clash_config(proxy_lines),
-            len(proxy_lines),
-            "masque",
-            default_name="sub.yaml",
+# ---- clash-rs 配置类转换器 ---------------------------------------------------
+
+
+def wg_node_to_clashrs(node: dict[str, Any]) -> dict[str, Any]:
+    """中性 WireGuard 节点 → clash-rs type=wireguard。
+
+    clash-rs 的 ip/ipv6 要求 CIDR 格式（与 mihomo 的裸地址不同），因此保留
+    wg-config.conf 地址自带的 /32、/128 位宽。
+    """
+    ipv4_str = ipv6_str = ""
+    for addr in node["addresses"]:
+        if ip_version(addr.split("/")[0]) == "IPv4":
+            ipv4_str = addr
+            break
+    for addr in node["addresses"]:
+        if ip_version(addr.split("/")[0]) == "IPv6":
+            ipv6_str = addr
+            break
+    proxy: dict[str, Any] = {
+        "name": node["name"],
+        "type": "wireguard",
+        "server": node["server"],
+        "port": node["port"],
+        "ip": ipv4_str or WG_FALLBACK_ADDRESS,
+        "private-key": node["private_key"],
+        "public-key": node["public_key"],
+        "udp": True,
+        "mtu": node["mtu"],
+        "remote-dns-resolve": True,
+        "dns": list(WG_DNS_SERVERS),
+    }
+    if ipv6_str:
+        proxy["ipv6"] = ipv6_str
+    return proxy
+
+
+def _replace_group_proxies_placeholder(
+    block_lines: list[str], names: list[str]
+) -> list[str]:
+    """把组块内的 proxies: [] 占位替换为实际节点名列表。"""
+    out = list(block_lines)
+    for i, line in enumerate(out):
+        if not re.match(r"^\s+proxies\s*:\s*\[\s*\]\s*$", line):
+            continue
+        indent = " " * (len(line) - len(line.lstrip()))
+        out[i : i + 1] = [f"{indent}proxies:"] + [
+            f"{indent}  - {name}" for name in names
+        ]
+        return out
+    return out
+
+
+def build_clashrs_config(proxy_lines: list[str], names: list[str]) -> str:
+    """clash-rs 模板注入：clash-rs 不支持 include-all，除顶层 proxies 占位外，
+    还需把节点写入 ♻️ 自动选择 组的 proxies:[] 占位，并追加到 🚀 节点选择 组。"""
+    ensure_readable_file(DIR_CLASHRS_TEMPLATE)
+    template = DIR_CLASHRS_TEMPLATE.read_text(encoding="utf-8")
+    if not template.strip():
+        raise ValueError("配置模板文件为空")
+    replacement = "proxies:\n" + "\n".join(proxy_lines)
+    text = CLASH_TEMPLATE_NODE_PLACEHOLDER.sub(lambda _: replacement, template, count=1)
+    lines, eol = _split_eol(text)
+    start, end = _top_section(lines, "proxy-groups")
+    blocks = _proxy_group_blocks(lines, start, end)
+    if MIHOMO_AUTO_GROUP not in blocks or "🚀 节点选择" not in blocks:
+        raise RuntimeError(
+            "clash-rs 模板缺少 🚀 节点选择 / ♻️ 自动选择 组，无法注入节点"
         )
+    rebuilt: list[str] = []
+    for name, block in blocks.items():
+        group_lines = lines[block["start"] : block["end"]]
+        if name == MIHOMO_AUTO_GROUP:
+            group_lines = _replace_group_proxies_placeholder(group_lines, names)
+        elif name == "🚀 节点选择":
+            for member in names:
+                group_lines = _append_member_to_block(group_lines, member)
+        rebuilt.extend(group_lines)
+    return eol.join(lines[: start + 1] + rebuilt + lines[end:])
+
+
+@register_converter(
+    "clashrs",
+    "wg → clash-rs 完整配置（不支持 masque/AmneziaWG）",
+    default_output="sub.yaml",
+)
+class ClashRsConverter(BaseConverter):
+    def fill_parser(self, parser: argparse.ArgumentParser) -> None:
+        add_source_args(parser, self.default_source)
+        add_output_arg(parser, self.default_output)
+        add_mtu_arg(parser)
+        add_limit_arg(parser, 80)
+        # 有意不声明 --protocol / --amnezia：clash-rs 仅支持 wg 且无 AmneziaWG
+        # 混淆，订阅表单据此自动冻结协议与混淆选项
+
+    def run(self, args: argparse.Namespace) -> None:
+        # collect_wg_nodes 读取 args.amnezia；clash-rs 不支持混淆，固定禁用
+        args.amnezia = None
+        nodes = collect_wg_nodes(args)
+        for node in nodes:
+            node["name"] = node_name(
+                node.pop("no"), node.pop("src_total"), node["server"], node["port"]
+            )
+        check_node_budget(len(nodes))
+        nodes = [wg_node_to_clashrs(node) for node in nodes]
+        names = [str(node["name"]) for node in nodes]
+        proxy_lines = [f"  - {json.dumps(node, ensure_ascii=False)}" for node in nodes]
+        config_text = build_clashrs_config(proxy_lines, names)
+        save_config(args, config_text, len(names), "wg")
 
 
 # ---- sing-box 配置类转换器 --------------------------------------------------
@@ -1075,100 +2054,46 @@ def load_singbox_template() -> dict:
 )
 class SingBoxConverter(BaseConverter):
     def fill_parser(self, parser: argparse.ArgumentParser) -> None:
-        add_source_args(parser, self.default_source)
+        add_protocol_source_args(parser)
         add_output_arg(parser, self.default_output)
         add_protocol_arg(parser)
         add_mtu_arg(parser)
         add_limit_arg(parser, 50)
         add_amnezia_arg(parser)
+        add_openvpn_args(parser)
 
     def run(self, args: argparse.Namespace) -> None:
-        if args.protocol == "masque":
-            self._run_masque(args)
-        else:
-            self._run_wg(args)
+        neutral = collect_nodes_by_protocol(args)
+        endpoints = [
+            wg_node_to_singbox(node) for node in neutral if node["kind"] == "wg"
+        ]
+        outbounds_nodes = [
+            masque_node_to_singbox(node) for node in neutral if node["kind"] == "masque"
+        ]
+        names = [str(item["tag"]) for item in endpoints] + [
+            str(item["tag"]) for item in outbounds_nodes
+        ]
 
-    def _run_wg(self, args: argparse.Namespace) -> None:
-        profile = load_wg_profile()
-        private_key = profile.private_key or WG_FALLBACK_PRIVATE_KEY
-        public_key = profile.public_key or WG_FALLBACK_PUBLIC_KEY
-        addresses = profile.addresses or [WG_FALLBACK_ADDRESS]
-        mtu = resolve_mtu(args.mtu, profile.mtu, DEFAULT_MTU_WG)
-        # reserved = profile.reserved_list
-        amnezia_random, amnezia_fixed = amnezia_mode(args.amnezia)
-        endpoints = load_endpoints(resolve_source_path(args))
+        openvpn_endpoints: list[dict] = []
+        if args.with_openvpn:
+            openvpn_endpoints = [
+                openvpn.to_singbox_endpoint(node, str(node["name"]), SINGBOX_DIAL_GROUP)
+                for node in fetch_openvpn_neutral(args, set(names))
+            ]
 
-        nodes, names = [], []
-        for i, ep in enumerate(endpoints[: args.limit]):
-            proxy_name = node_name(i + 1, len(endpoints), ep.host_bare, ep.port)
-            node = {
-                "type": "wireguard",
-                "tag": proxy_name,
-                "mtu": mtu,
-                "address": addresses,
-                "private_key": private_key,
-                "peers": [
-                    {
-                        "address": ep.host_bare,
-                        "port": int(ep.port),
-                        "public_key": public_key,
-                        "allowed_ips": ["0.0.0.0/0", "::/0"],
-                        # "reserved": reserved,
-                    }
-                ],
-            }
-            params = generate_amnezia_params() if amnezia_random else amnezia_fixed
-            if params:
-                node.update(amnezia_config_fields(params, snake_case=True))
-            names.append(proxy_name)
-            nodes.append(node)
+        check_node_budget(len(names) + len(openvpn_endpoints))
 
         config = load_singbox_template()
+        config.setdefault("endpoints", []).extend(endpoints)
+        config.setdefault("outbounds", []).extend(outbounds_nodes)
         fill_singbox_selector_names(config, names)
-        config.setdefault("endpoints", []).extend(nodes)
+        if openvpn_endpoints:
+            inject_singbox_openvpn(config, openvpn_endpoints, group=args.openvpn_group)
         save_config(
             args,
             json.dumps(config, ensure_ascii=False, indent=2),
-            len(nodes),
-            "wg",
-            default_name="sub.json",
-        )
-
-    def _run_masque(self, args: argparse.Namespace) -> None:
-        masque = load_masque_config()
-        mtu = resolve_mtu(args.mtu, None, DEFAULT_MTU_MASQUE)
-        endpoints = load_endpoints(resolve_source_path(args))
-        nodes, names = [], []
-        for i, ep in enumerate(endpoints[: args.limit], start=1):
-            ip, port = ep.host_bare, int(ep.port)
-            name = node_name(i, len(endpoints), ip, port)
-            nodes.append(
-                {
-                    "type": "masque",
-                    "tag": name,
-                    "server": ip,
-                    "server_port": port,
-                    "profile": "cloudflare",
-                    "vhttp": "auto",
-                    "private_key": masque.private_key,
-                    "public_key": masque.public_key,
-                    "ip": masque.ipv4,
-                    "ipv6": masque.ipv6,
-                    "mtu": mtu,
-                    "tls": {"enabled": True, "server_name": MASQUE_SERVER_NAME},
-                }
-            )
-            names.append(name)
-
-        config = load_singbox_template()
-        fill_singbox_selector_names(config, names)
-        config.setdefault("outbounds", []).extend(nodes)
-        save_config(
-            args,
-            json.dumps(config, ensure_ascii=False, indent=2),
-            len(nodes),
-            "masque",
-            default_name="sub.json",
+            len(names) + len(openvpn_endpoints),
+            node_kind_label(args, bool(openvpn_endpoints)),
         )
 
 
@@ -1204,28 +2129,40 @@ def add_serve_args(parser: argparse.ArgumentParser, with_serve: bool) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG_NAME,
-        description="cfwarp-converter：把 Cloudflare WARP（WireGuard / MASQUE）配置转换成第三方代理软件的节点链接或完整配置。",
+        description="cfwarp-converter：把 Cloudflare WARP（WireGuard/MASQUE）配置转换成第三方代理软件的节点链接或完整配置。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
             "- WireGuard 协议\n"
             f"  {PROG_NAME} nekoray --source csv\n"
             f"  {PROG_NAME} v2rayn  --source csv\n"
+            f"  {PROG_NAME} nyamebox  --source csv\n"
+            f"  {PROG_NAME} nyamebox  --source csv --amnezia\n"
             f"  {PROG_NAME} throne  --source csv\n"
             f"  {PROG_NAME} throne  --source csv --amnezia\n"
+            f"  {PROG_NAME} hiddify --source csv --amnezia\n"
             f"  {PROG_NAME} singbox --source csv\n"
             f"  {PROG_NAME} singbox --source csv --amnezia\n"
             f"  {PROG_NAME} mihomo  --source csv\n"
             f"  {PROG_NAME} mihomo  --source csv --amnezia\n"
+            f"  {PROG_NAME} clashrs --source csv\n"
             f"  {PROG_NAME} sn     --source csv --limit 50\n"
             "- MASQUE 协议\n"
             f"  {PROG_NAME} mihomo  --protocol masque --source txt\n"
             f"  {PROG_NAME} singbox --protocol masque --source txt\n"
+            f"  {PROG_NAME} hiddify --protocol masque\n"
+            "- wg+masque 对半混合\n"
+            f"  {PROG_NAME} mihomo  --protocol mix --limit 20\n"
+            f"  {PROG_NAME} throne  --source csv --protocol mix\n"
+            f"  {PROG_NAME} hiddify --protocol mix --limit 20\n"
+            "- OpenVPN(VPN Gate) 注入（默认关闭；openvpn 手动组不自动测速）\n"
+            f"  {PROG_NAME} mihomo  --source csv --with-openvpn --openvpn-limit 10\n"
+            f"  {PROG_NAME} singbox --protocol masque --with-wg 5 --with-openvpn --no-ipv6\n"
             "- 本地订阅页面 (网页展示 sub.txt/sub.yaml/sub.json 内容)\n"
             f"  {PROG_NAME} server\n"
             f"  {PROG_NAME} server --host 0.0.0.0\n"
-            f"  {PROG_NAME} nekoray --source csv --server\n"
-            f"  {PROG_NAME}    (不带参数等同 server)\n"
+            f"  {PROG_NAME} throne --source csv --server\n"
+            f"  {PROG_NAME} (不带参数等同 server)\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="子命令")
