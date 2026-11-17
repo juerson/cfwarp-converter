@@ -1,10 +1,14 @@
+#!/usr/bin/env python3.11
+
 """本地订阅页面 + 网页订阅链接生成（独立展示层模块）。
 
 main.py 只 import 本模块并调用 server_sub_page()；CLI 转换命令不经过本模块。
 
 设计要点：
-- 首页（/）内嵌订阅链接生成表单：选择客户端与参数，点击生成后页面下方显示
-  可复制的订阅 URL（左侧二维码、右侧链接，纯前端拼参数，不跳转页面）。
+- 首页（/）内嵌两个订阅链接生成表单（订阅链接生成 + OpenVPN）：选择客户端与参数，
+  点击生成后页面下方显示可复制的订阅 URL（左侧二维码、右侧链接，纯前端拼参数，不跳转）。
+- 两个表单行为一致：切换客户端即恢复默认（默认值统一放在控件的 data-default 属性，
+  JS 一键还原）；参数改动后已生成的链接标记为过期。
 - 该 URL 是订阅链接：客户端或浏览器打开它时，服务端实时转换一次，以纯文本
   （text/plain）返回结果——与 /sub.txt 的内容展示格式完全一致，无任何 HTML 包装。
 - 转换结果不写任何文件：server_sub_page 启动时把 main.write_text_file 替换为
@@ -17,7 +21,9 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import socket
+import sys
 import threading
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,12 +35,15 @@ except ModuleNotFoundError:  # 二维码为可选能力：未安装时订阅页�
     segno = None
 
 import main
-from main import BASE_DIR, CONVERTERS
+from main import BASE_DIR, CONVERTERS, OPENVPN_AI_GROUP
+from openvpn import MAX_OPENVPN_NODES
 
 SUB_PAGE_FILES = ("sub.txt", "sub.yaml", "sub.json")
 SUB_PAGE_PATHS = {f"/{name}": name for name in SUB_PAGE_FILES}
 SUB_PAGE_PORT = 8790
 CONVERT_PAGE = "/convert"
+OPENVPN_CONVERT_PAGE = "/convert-openvpn"
+OPENVPN_CLIENTS = ("mihomo", "singbox")
 QR_MAX_DATA = 1000  # 二维码数据长度上限（QR byte 模式容量的保守值）
 QR_SCALE = 4
 QR_BORDER = 2
@@ -93,47 +102,76 @@ def _client_attr(dest: str) -> str:
     return f' data-clients="{clients}"' if clients else ""
 
 
+# 约定：控件的默认值统一渲染在 data-default 属性里，切换客户端时 JS 据此还原；
+# select 的第一个 option 与 data-default 保持一致，页面初始状态即默认状态。
 SUB_PAGE_STYLE = (
+    # ---- 设计变量：亮色默认，跟随系统暗色模式 ----
+    ":root{--bg:#f4f6fb;--card:#ffffff;--border:#e5e7eb;--text:#1f2937;--muted:#6b7280;"
+    "--accent:#2563eb;--accent-hover:#1d4ed8;--accent-soft:#eff6ff;"
+    "--field:#ffffff;--field-border:#d1d5db;--shadow:0 1px 3px rgba(15,23,42,.07);"
+    "--focus-ring:0 0 0 3px rgba(37,99,235,.18)}"
+    "@media (prefers-color-scheme:dark){:root{--bg:#0b1220;--card:#151e31;--border:#2a3650;"
+    "--text:#e5eaf3;--muted:#94a3b8;--accent:#3b82f6;--accent-hover:#60a5fa;--accent-soft:#1e2a44;"
+    "--field:#0f1830;--field-border:#334155;--shadow:0 1px 3px rgba(0,0,0,.4);"
+    "--focus-ring:0 0 0 3px rgba(59,130,246,.25)}}"
     "*{box-sizing:border-box;margin:0}"
     "html{scrollbar-gutter:stable}"
     "body{font-family:system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;"
-    "background:#f5f7fa;color:#1f2937;padding:32px 16px}"
+    "background:var(--bg);color:var(--text);padding:32px 16px;-webkit-font-smoothing:antialiased}"
     ".wrap{max-width:860px;margin:0 auto}"
     "h1{font-size:22px;margin-bottom:4px}"
-    "h2{font-size:16px;margin:20px 0 10px}"
-    ".sub{color:#6b7280;font-size:13px;margin-bottom:24px}"
+    "h2{font-size:16px;margin:24px 0 10px;display:flex;align-items:center;gap:8px}"
+    "h2::before{content:'';width:4px;height:16px;border-radius:2px;background:var(--accent)}"
+    ".sub{color:var(--muted);font-size:13px;margin-bottom:16px;line-height:1.6}"
     ".grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:16px}"
-    ".card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px;text-align:center}"
-    ".card img{width:150px;height:150px}"
+    ".card{background:var(--card);border:1px solid var(--border);border-radius:14px;"
+    "padding:16px;text-align:center;box-shadow:var(--shadow)}"
+    ".card img{width:150px;height:150px;border-radius:10px}"
     ".qrmiss{width:150px;height:150px;display:flex;align-items:center;justify-content:center;"
-    "margin:0 auto;background:#f3f4f6;border-radius:8px;color:#9ca3af;font-size:13px}"
+    "margin:0 auto;background:var(--accent-soft);border-radius:10px;color:var(--muted);font-size:13px}"
     ".qname{font-size:13px;font-weight:600;margin-top:10px}"
-    ".qurl{font-size:11px;color:#6b7280;word-break:break-all;margin-top:2px}"
-    ".tip{font-size:12px;color:#4b5563;background:#eef2ff;border:1px solid #e0e7ff;"
-    "border-radius:8px;padding:10px 14px;margin-bottom:16px}"
-    ".tip code{background:#e0e7ff;border-radius:4px;padding:1px 5px}"
-    ".list{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:4px 16px;margin-bottom:16px}"
-    ".row{display:flex;justify-content:space-between;align-items:center;padding:13px 4px;"
-    "border-bottom:1px solid #f3f4f6;text-decoration:none;color:inherit}"
-    ".row:last-child{border-bottom:none}"
-    ".row b{font-size:15px}.row span{font-size:12px;color:#6b7280}"
-    ".miss{color:#9ca3af}"
-    ".form{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px 20px;"
-    "display:grid;grid-template-columns:1fr 1fr;gap:12px 16px;margin-bottom:16px}"
-    ".form label{font-size:12px;color:#6b7280;display:flex;flex-direction:column;gap:4px}"
-    ".form select,.form input{padding:7px 10px;border:1px solid #d1d5db;border-radius:8px;"
-    "font-size:14px;color:#1f2937}"
-    ".form button{align-self:end;padding:9px 10px;background:#2563eb;color:#fff;border:none;"
-    "border-radius:8px;font-size:15px;cursor:pointer}"
-    ".subgen{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin-bottom:16px}"
-    ".qrerr{color:#b91c1c;font-size:12px;margin-top:6px;display:none}"
+    ".qsize{font-size:11px;font-weight:400;color:var(--muted)}"
+    "a.qurl{display:block;font-size:11px;color:var(--muted);word-break:break-all;"
+    "margin-top:2px;text-decoration:none;transition:color .15s}"
+    "a.qurl:hover{color:var(--accent)}"
+    ".tip{font-size:12px;color:var(--text);background:var(--accent-soft);"
+    "border:1px solid var(--border);border-radius:10px;padding:10px 14px;"
+    "margin-bottom:16px;line-height:1.7}"
+    ".tip code{background:var(--field);border:1px solid var(--border);border-radius:4px;padding:1px 5px}"
+    ".form{background:var(--card);border:1px solid var(--border);border-radius:14px;"
+    "padding:18px 20px;display:grid;grid-template-columns:1fr 1fr;gap:12px 16px;"
+    "margin-bottom:16px;box-shadow:var(--shadow)}"
+    ".form label{font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:5px}"
+    ".form select,.form input{padding:8px 11px;border:1px solid var(--field-border);"
+    "border-radius:9px;font-size:14px;color:var(--text);background:var(--field);"
+    "transition:border-color .15s,box-shadow .15s;width:100%}"
+    ".form select:hover,.form input:hover{border-color:var(--accent)}"
+    ".form select:focus,.form input:focus{outline:none;border-color:var(--accent);"
+    "box-shadow:var(--focus-ring)}"
+    ".form button{grid-column:1/-1;justify-self:center;width:fit-content;"
+    "padding:9px 30px;background:var(--accent);color:#fff;border:none;border-radius:10px;"
+    "font-size:14px;font-weight:600;cursor:pointer;margin-top:4px;"
+    "transition:background .15s,transform .1s,box-shadow .15s}"
+    ".form button:hover{background:var(--accent-hover);box-shadow:0 3px 10px rgba(37,99,235,.3)}"
+    ".form button:active{transform:translateY(1px)}"
+    ".form .chk{flex-direction:row;align-items:center;gap:8px;font-size:13px;"
+    "color:var(--text);padding-top:18px}"
+    ".form .chk input{width:auto;accent-color:var(--accent)}"
+    ".subgen{background:var(--card);border:1px solid var(--border);border-radius:14px;"
+    "padding:16px;margin-bottom:16px;box-shadow:var(--shadow)}"
+    ".qrerr{color:#ef4444;font-size:12px;margin-top:6px;display:none}"
     ".substale{min-height:130px;display:none;align-items:center;justify-content:center;"
-    "text-align:center;color:#6b7280;font-size:13px}"
+    "text-align:center;color:var(--muted);font-size:13px}"
     ".subrow{display:flex;gap:14px;align-items:center}"
-    ".subqr{width:130px;height:130px;flex:none}"
+    ".subqr{width:130px;height:130px;flex:none;border-radius:10px}"
     ".suburl{flex:1;word-break:break-all;font-size:12px;font-family:Consolas,monospace;"
-    "background:#f3f4f6;border-radius:6px;padding:10px 12px;cursor:pointer}"
+    "background:var(--accent-soft);border:1px solid var(--border);border-radius:8px;"
+    "padding:10px 12px;cursor:pointer;transition:border-color .15s}"
+    ".suburl:hover{border-color:var(--accent)}"
     ".off{opacity:.45}"
+    # ---- 小屏自适应：卡片与表单改单列，二维码结果纵向堆叠 ----
+    "@media (max-width:640px){.grid{grid-template-columns:1fr}"
+    ".form{grid-template-columns:1fr}.subrow{flex-direction:column}}"
 )
 
 
@@ -203,61 +241,207 @@ CLIENT_ALIASES = {
     "nyamebox": "NyameBox/NekoBox",
     "v2rayn": "v2rayN(G)",
     "mihomo": "mihomo 内核",
+    "clashrs": "clash-rs 内核",
     "singbox": "sing-box/sing-box-lx 内核",
+    "hiddify": "Hiddify",
 }
 
+# 这些客户端的 --source 支持"按协议默认"：留空时 wg=result.csv、masque=ip.txt
+PROTOCOL_SOURCE_CLIENTS = {"mihomo", "singbox", "hiddify"}
 
-def _form_fields(form: dict[str, str]) -> str:
+
+def _form_fields() -> str:
     """渲染固定字段集；data-clients 声明各参数的可用客户端，JS 按 client 启用/禁用。"""
-    selected = form.get("client", "")
     options = "".join(
-        f'<option value="{name}" data-source="{CONVERTERS[name].default_source}"'
-        f'{" selected" if name == selected else ""}>'
+        f'<option value="{name}" data-source="'
+        f'{"" if name in PROTOCOL_SOURCE_CLIENTS else CONVERTERS[name].default_source}">'
         f"{name} ({CLIENT_ALIASES.get(name, name)})</option>"
         for name in CONVERTERS
     )
     fields = [
         f'<label>客户端（转换目标）<select name="client" onchange="changeClient()">{options}</select></label>',
         (
-            f"<label>协议（仅 Throne / mihomo / sing-box 使用）"
-            f'<select name="protocol" onchange="applySupport()"{_client_attr("protocol")}>'
+            f"<label>协议（按客户端支持）"
+            f'<select name="protocol" data-default="wg" onchange="applySupport()"{_client_attr("protocol")}>'
             '<option value="wg">wg</option>'
-            '<option value="masque">masque</option></select></label>'
+            '<option value="masque">masque</option>'
+
+            '<option value="mix">wg + masque 混合（对半分配上限）</option></select></label>'
         ),
         (
-            f'<label>数据源 <select name="source"{_client_attr("source")}>'
+            f'<label>数据源 <select name="source" data-default=""{_client_attr("source")}>'
+            '<option value="">按协议默认（wg=result.csv / masque=ip.txt）</option>'
             '<option value="csv">csv (result.csv)</option>'
             '<option value="txt">txt (ip.txt)</option></select></label>'
         ),
         (
-            f"<label>AmneziaWG 混淆（仅 wg 协议 + 支持的客户端）"
-            f'<select name="amnezia_mode"{_client_attr("amnezia")} data-needs-wg="1">'
+            f'<label class="chk"><input type="checkbox" name="no_ipv6" data-default="0"'
+            f"{_client_attr('no_ipv6')}> 剔除 IPv6 数据（csv/txt 通用）</label>"
+        ),
+        (
+            f"<label>AmneziaWG 混淆（wg/awg/mix 协议 + 支持的客户端）"
+            f'<select name="amnezia_mode" data-default="off"{_client_attr("amnezia")} data-needs-wg="1">'
             '<option value="off">禁用</option>'
             '<option value="random">每节点随机</option>'
             '<option value="custom">自定义</option></select></label>'
         ),
         (
             f'<label>AmneziaWG 自定义参数 <input type="text" name="amnezia_custom" '
-            f'placeholder="jc=6&jmin=36&jmax=398（选择自定义时生效）"{_client_attr("amnezia")} '
+            f'data-default="" placeholder="jc=6&amp;jmin=36&amp;jmax=398（选择自定义时生效）"{_client_attr("amnezia")} '
             f'data-needs-wg="1"></label>'
         ),
         (
             f'<label>节点数上限（留空=各客户端默认）<input type="number" name="limit" '
-            f'placeholder="默认：全部 / 500 / 80 / 50"{_client_attr("limit")}></label>'
+            f'data-default="" placeholder="默认：全部 / 500 / 80 / 50"{_client_attr("limit")}></label>'
         ),
         (
             f'<label>MTU（1280~1500，留空=配置文件值或协议默认）<input type="number" name="mtu" '
-            f'placeholder="默认：wg=1340 / masque=1361"{_client_attr("mtu")}></label>'
+            f'data-default="" placeholder="默认：wg=1340 / masque=1361"{_client_attr("mtu")}></label>'
         ),
     ]
     return "".join(fields)
 
 
+def _openvpn_form_fields() -> str:
+    """OpenVPN 独立区块的字段集；默认值统一放在 data-default，切客户端一键还原。"""
+    client_options = "".join(
+        f'<option value="{name}">{name} ({CLIENT_ALIASES.get(name, name)})</option>'
+        for name in OPENVPN_CLIENTS
+    )
+    fields = [
+        f'<label>客户端（转换目标）<select name="client" onchange="openvpnChangeClient()">{client_options}</select></label>',
+        (
+            '<label>主协议<select name="mix" data-default="wg" onchange="openvpnMix()">'
+            '<option value="wg">全 wg</option>'
+            '<option value="masque">全 masque</option>'
+            '<option value="mix">wg + masque 混合（对半分配上限）</option></select></label>'
+        ),
+        (
+            '<label>数据源<select name="source" data-default="">'
+            '<option value="">按协议默认（wg=result.csv / masque=ip.txt）</option>'
+            '<option value="csv">csv (result.csv)</option>'
+            '<option value="txt">txt (ip.txt)</option></select></label>'
+        ),
+        (
+            '<label class="chk"><input type="checkbox" name="no_ipv6" data-default="0"> '
+            "剔除 IPv6 数据（csv/txt 通用）</label>"
+        ),
+        (
+            '<label>AmneziaWG 混淆（wg 参与时生效）<select name="amnezia_mode" '
+            'data-default="off" data-needs-wg="1">'
+            '<option value="off">禁用</option>'
+            '<option value="random">每节点随机</option>'
+            '<option value="custom">自定义</option></select></label>'
+        ),
+        (
+            '<label>混淆自定义参数（选择自定义时生效）<input type="text" name="amnezia_custom" '
+            'data-default="" placeholder="jc=6&amp;jmin=36&amp;jmax=398" data-needs-wg="1"></label>'
+        ),
+        (
+            '<label>主协议节点数<input type="number" name="limit" '
+            'data-default="30" value="30" min="1" max="150"></label>'
+        ),
+        (
+            f'<label>副协议 OpenVPN 数量（1~{MAX_OPENVPN_NODES}）<input type="number" '
+            f'name="openvpn_limit" data-default="10" value="10" min="1" max="{MAX_OPENVPN_NODES}"></label>'
+        ),
+        (
+            '<label>国家代码筛选（逗号分隔）<input type="text" name="countries" '
+            'data-default="" placeholder="JP,KR,US（留空=全部）"></label>'
+        ),
+        (
+            f'<label>自定义 OpenVPN 代理组名<input type="text" name="openvpn_group" '
+            f'data-default="{OPENVPN_AI_GROUP}" value="{OPENVPN_AI_GROUP}"></label>'
+        ),
+        (
+            '<label>VPN Gate API 地址<input type="text" name="api_url" '
+            'data-default="" placeholder="留空=官方接口"></label>'
+        ),
+        (
+            '<label>节点排序<select name="openvpn_sort" data-default="api">'
+            '<option value="api">api（接口原序）</option>'
+            '<option value="score">score（综合评分）</option>'
+            '<option value="ping">ping（延迟优先）</option>'
+            '<option value="speed">speed（带宽优先）</option></select></label>'
+        ),
+        (
+            '<label>设置本机代理（用于抓取 VPN Gate 的 openVPN 数据）<input type="text" name="openvpn_proxy" '
+            'data-default="" placeholder="http://127.0.0.1:7897（留空=自动探测本机常见端口，无则直连抓取数据）" '
+            'title="只支持 HTTP 代理；Clash / v2rayN 的混合端口同一端口同时收 '
+            'HTTP 与 socks5，直接填 http://127.0.0.1:端口 即可"></label>'
+        ),
+    ]
+    return "".join(fields)
+
+
+def _openvpn_form_section() -> str:
+    """首页独立的 OpenVPN(VPN Gate) 订阅链接生成区。"""
+    return (
+        "<h2>【进阶玩法】OpenVPN（VPN Gate）</h2>"
+        '<p class="sub">在 wg/masque/wg+masque 订阅配置里面插入 OpenVPN 副协议的节点，流量走指定的网站才启用 OpenVPN</p>'
+        '<form class="form" id="ovpnform" oninput="staleForm(\'ovpnform\')" '
+        "onchange=\"staleForm('ovpnform')\">"
+        f"{_openvpn_form_fields()}"
+        '<button type="button" onclick="genOpenvpnLink()">生成订阅链接</button>'
+        "</form>"
+        '<div class="subgen" id="ovpngen" style="display:none">'
+        '<div id="ovpnresult">'
+        '<div class="subrow"><img id="ovpnqr" class="subqr" alt="订阅链接二维码">'
+        '<code id="ovpnurl" class="suburl" onclick="copySubUrl(\'ovpnurl\')" '
+        'title="点击复制订阅链接"></code></div>'
+        '<div class="qrerr" id="ovpnqrerr">二维码生成失败（未安装 segno 或链接过长），链接本身仍可使用</div>'
+        "</div>"
+        '<div class="substale" id="ovpnstale">参数已变更，请点击“生成订阅链接”'
+        "重新生成</div>"
+        "</div>" + _OPENVPN_FORM_SCRIPT
+    )
+
+
+# 共用脚本：两个表单的结果区结构一致（FORMS 注册表），重置/过期提示通用
 _FORM_SCRIPT = """<script>
+var QR_BASE=LAN_BASE||window.location.origin;
+var FORMS={
+  cform:{gen:'subgen',result:'subresult',stale:'substale',qr:'subqr',url:'suburl',err:'qrerr'},
+  ovpnform:{gen:'ovpngen',result:'ovpnresult',stale:'ovpnstale',qr:'ovpnqr',url:'ovpnurl',err:'ovpnqrerr'}
+};
+function staleForm(id){
+  var cfg=FORMS[id],gen=document.getElementById(cfg.gen);
+  if(!gen||gen.style.display==='none')return;
+  document.getElementById(cfg.result).style.display='none';
+  document.getElementById(cfg.stale).style.display='flex';
+}
+function resetForm(id){
+  var f=document.getElementById(id);
+  f.querySelectorAll('[data-default]').forEach(function(el){
+    if(el.name==='client')return;                    // 切换的发起者保持新选择
+    if(el.type==='checkbox'){el.checked=el.getAttribute('data-default')==='1';}
+    else{el.value=el.getAttribute('data-default');}
+  });
+  var sel=f.querySelector('[name=client]');
+  var src=f.querySelector('[name=source]');
+  if(sel&&src&&sel.selectedOptions[0]){              // 数据源默认值跟随客户端
+    var ds=sel.selectedOptions[0].getAttribute('data-source');
+    if(ds!==null)src.value=ds;
+  }
+  staleForm(id);                                     // 生成过才提示重新生成，未生成不留空白
+}
+function collectParams(f,skip){
+  var p=new URLSearchParams();
+  new FormData(f).forEach(function(v,k){
+    if(typeof v!=='string')return;
+    if(k==='no_ipv6'){p.append(k,'1');return;}       // checkbox 统一传 1
+    v=v.trim();
+    if(!v)return;                                    // 空值不写进链接（服务端默认值等价）
+    if(skip&&skip(k,v))return;
+    p.append(k,v);
+  });
+  return p;
+}
 function applySupport(){
   var f=document.getElementById('cform');
   var c=f.querySelector('[name=client]').value;
-  var wg=f.querySelector('[name=protocol]').value==='wg';
+  var pv=f.querySelector('[name=protocol]').value;
+  var wg=(pv==='wg'||pv==='mix');            // 混合模式含 wg 节点，混淆同样生效
   f.querySelectorAll('[data-clients]').forEach(function(el){
     var ok=el.getAttribute('data-clients').split(',').indexOf(c)>=0;
     if(ok&&el.hasAttribute('data-needs-wg')) ok=wg;
@@ -266,38 +450,21 @@ function applySupport(){
   });
 }
 function changeClient(){
-  resetForm();
+  resetForm('cform');
   applySupport();
 }
-function resetForm(){
-  var f=document.getElementById('cform');
-  var sel=f.querySelector('[name=client]');
-  var srcDefault=sel.selectedOptions[0].getAttribute('data-source')||'csv';
-  f.querySelectorAll('input').forEach(function(el){el.value='';});
-  f.querySelector('[name=protocol]').value='wg';
-  f.querySelector('[name=source]').value=srcDefault;
-  f.querySelector('[name=amnezia_mode]').value='off';
-  var img=document.getElementById('subqr');
-  img.onload=null;img.onerror=null;
-  img.removeAttribute('src');img.style.visibility='hidden';
-  document.getElementById('suburl').textContent='';
-  document.getElementById('qrerr').style.display='none';
-  var gen=document.getElementById('subgen');
-  if(gen.style.display!=='none'){          // 生成过才保留提示区，未生成时不留空白
-    document.getElementById('subresult').style.display='none';
-    document.getElementById('substale').style.display='flex';
-  }
+function revealGen(id){
+  // 结果块就在生成按钮下方：已在视口内就不滚动；被遮挡时才最小幅度平滑滚入
+  var g=document.getElementById(id);
+  var r=g.getBoundingClientRect();
+  var vh=window.innerHeight||document.documentElement.clientHeight;
+  if(r.top<0||r.top>=vh||r.bottom>vh) g.scrollIntoView({behavior:'smooth',block:'nearest'});
 }
 function genLink(){
   var f=document.getElementById('cform');
-  var p=new URLSearchParams();
-  new FormData(f).forEach(function(v,k){
-    if(typeof v!=='string') return;
-    v=v.trim();
-    if(!v) return;                                   // 空值不写进链接（服务端默认值等价）
-    if(k==='amnezia_mode'&&v==='off') return;        // off 是服务端默认值，省略
-    if(k==='amnezia_custom'&&f.querySelector('[name=amnezia_mode]').value!=='custom') return;
-    p.append(k,v);
+  var p=collectParams(f,function(k,v){
+    if(k==='amnezia_mode'&&v==='off')return true;    // off 是服务端默认值，省略
+    return k==='amnezia_custom'&&f.querySelector('[name=amnezia_mode]').value!=='custom';
   });
   var url=window.location.origin+'/convert?'+p.toString();
   document.getElementById('suburl').textContent=url;
@@ -306,14 +473,14 @@ function genLink(){
   img.onload=function(){img.style.visibility='visible';hint.style.display='none';};
   img.onerror=function(){img.style.visibility='hidden';hint.style.display='block';};
   img.style.visibility='hidden';
-  img.src='/qr?data='+encodeURIComponent(url);
+  img.src='/qr?data='+encodeURIComponent(QR_BASE+'/convert?'+p.toString());
   document.getElementById('subresult').style.display='block';
   document.getElementById('substale').style.display='none';
   document.getElementById('subgen').style.display='block';
-  document.getElementById('subgen').scrollIntoView({behavior:'smooth'});
+  revealGen('subgen');
 }
-function copySubUrl(){
-  var u=document.getElementById('suburl');
+function copySubUrl(id){
+  var u=document.getElementById(id||'suburl');
   var t=u.textContent;
   if(!t) return;
   function ok(){u.style.color='#16a34a';setTimeout(function(){u.style.color='';},1200);}
@@ -345,6 +512,47 @@ applySupport();
 </script>"""
 
 
+_OPENVPN_FORM_SCRIPT = """<script>
+var QR_BASE=LAN_BASE||window.location.origin;
+function openvpnMix(){
+  var f=document.getElementById('ovpnform');
+  if(!f) return;
+  var mix=f.querySelector('[name=mix]').value;
+  var hasWg=(mix!=='masque');          // AmneziaWG 只要有 wg 参与（全 wg 或混合）就生效
+  // 全 masque 时没有 wg 节点，混淆无从谈起，直接禁用
+  f.querySelectorAll('[data-needs-wg]').forEach(function(el){
+    el.disabled=!hasWg;
+    var lb=el.closest('label'); if(lb) lb.classList.toggle('off',!hasWg);
+  });
+  staleForm('ovpnform');
+}
+function openvpnChangeClient(){
+  resetForm('ovpnform');
+  openvpnMix();
+}
+function genOpenvpnLink(){
+  var f=document.getElementById('ovpnform');
+  var p=collectParams(f,function(k,v){
+    if(k==='amnezia_mode'&&v==='off')return true;    // off 是服务端默认值，省略
+    return k==='amnezia_custom'&&f.querySelector('[name=amnezia_mode]').value!=='custom';
+  });
+  var url=window.location.origin+'/convert-openvpn?'+p.toString();
+  document.getElementById('ovpnurl').textContent=url;
+  var img=document.getElementById('ovpnqr');
+  var hint=document.getElementById('ovpnqrerr');
+  img.onload=function(){img.style.visibility='visible';hint.style.display='none';};
+  img.onerror=function(){img.style.visibility='hidden';hint.style.display='block';};
+  img.style.visibility='hidden';
+  img.src='/qr?data='+encodeURIComponent(QR_BASE+'/convert-openvpn?'+p.toString());
+  document.getElementById('ovpnresult').style.display='block';
+  document.getElementById('ovpnstale').style.display='none';
+  document.getElementById('ovpngen').style.display='block';
+  revealGen('ovpngen');
+}
+openvpnMix();
+</script>"""
+
+
 # ============================================================================
 # 实时转换（内存直出，零落盘）
 # ============================================================================
@@ -367,15 +575,17 @@ def _form_argv(client: str, form: dict[str, str]) -> list[str]:
             value = form.get(name, "").strip()
             if value:
                 argv += [f"--{name}", value]
+    if "no_ipv6" in supported and form.get("no_ipv6"):
+        argv.append("--no-ipv6")
     if "amnezia" in supported:
         mode = form.get("amnezia_mode", "off")
         custom = form.get("amnezia_custom", "").strip()
         protocol = form.get("protocol", "").strip() or "wg"
         try:
-            is_wg = main.protocol_type(protocol) == "wg"
+            has_wg = main.protocol_type(protocol) in ("wg", "mix")
         except argparse.ArgumentTypeError as error:
             raise ValueError(str(error)) from error
-        if is_wg:
+        if has_wg:
             if mode == "random":
                 argv.append("--amnezia")
             elif mode == "custom" and custom:
@@ -383,16 +593,15 @@ def _form_argv(client: str, form: dict[str, str]) -> list[str]:
     return argv
 
 
-def run_in_memory(form: dict[str, str]) -> str:
-    """按表单参数实时转换一次，返回结果文本；全程内存，零落盘。"""
-    client = form.get("client", "")
+def _run_client_in_memory(client: str, argv: list[str]) -> str:
+    """按客户端解析 argv 并实时转换一次，结果写内存收集器。"""
     converter_cls = CONVERTERS.get(client)
     if converter_cls is None:
         raise ValueError(
             f"未知客户端：{client or '(未指定)'}，可选：{' / '.join(CONVERTERS)}"
         )
     conv = converter_cls()
-    args = PARSERS[client].parse_args(_form_argv(client, form))
+    args = PARSERS[client].parse_args(argv)
     args.converter = conv
     # 仅用于日志展示：输出已被内存收集器接管，不会落盘
     args.output = "<内存>"
@@ -410,6 +619,61 @@ def run_in_memory(form: dict[str, str]) -> str:
     return chunks[-1]
 
 
+def run_in_memory(form: dict[str, str]) -> str:
+    """按现有客户端表单参数实时转换一次，返回结果文本；全程内存，零落盘。"""
+    client = form.get("client", "")
+    return _run_client_in_memory(client, _form_argv(client, form))
+
+
+def _openvpn_argv(client: str, form: dict[str, str]) -> list[str]:
+    """把 OpenVPN 区块字段翻译成 mihomo / sing-box 的 CLI 参数。"""
+    mix = form.get("mix", "wg")
+    protocol = {"wg": "wg", "masque": "masque", "mix": "mix"}.get(mix, "wg")
+    argv = ["--with-openvpn", "--protocol", protocol]
+
+    source = form.get("source", "")
+    if source in ("csv", "txt"):
+        argv += ["--source", source]
+
+    limit = form.get("limit", "").strip()
+    if limit:
+        argv += ["--limit", limit]
+    if form.get("no_ipv6"):
+        argv.append("--no-ipv6")
+
+    argv += ["--openvpn-limit", form.get("openvpn_limit", "").strip() or "10"]
+    for dest in ("countries", "api_url", "openvpn_group", "openvpn_proxy"):
+        value = form.get(dest, "").strip()
+        if value:
+            argv += [f"--{dest.replace('_', '-')}", value]
+    sort_mode = form.get("openvpn_sort", "").strip()
+    if sort_mode:
+        argv += ["--openvpn-sort", sort_mode]
+
+    if mix in ("wg", "mix"):
+        mode = form.get("amnezia_mode", "off")
+        custom = form.get("amnezia_custom", "").strip()
+        if mode == "random":
+            argv.append("--amnezia")
+        elif mode == "custom" and custom:
+            argv += ["--amnezia", custom]
+
+    # 网页请求必须有界：客户端订阅超时远小于 CLI 默认值
+    argv += ["--openvpn-timeout", "15", "--openvpn-retries", "2"]
+    return argv
+
+
+def run_openvpn_in_memory(form: dict[str, str]) -> str:
+    """OpenVPN 独立区块：实时抓取 VPN Gate 并生成订阅内容。"""
+    client = form.get("client", "")
+    if client not in OPENVPN_CLIENTS:
+        raise ValueError(
+            f"OpenVPN 只支持 {' / '.join(OPENVPN_CLIENTS)}，"
+            f"当前为：{client or '(未指定)'}"
+        )
+    return _run_client_in_memory(client, _openvpn_argv(client, form))
+
+
 # ============================================================================
 # HTTP 处理器与启动
 # ============================================================================
@@ -419,7 +683,8 @@ class SubPageHandler(BaseHTTPRequestHandler):
     """订阅展示 + 订阅链接内容端点的请求处理器。
 
     路由白名单：/（订阅首页 + 表单）、/convert（订阅链接内容，纯文本）、
-    /qr（按需生成二维码）、三个 sub 文件路径；每次请求都重新读文件。
+    /convert-openvpn（OpenVPN 订阅内容，纯文本）、/qr（按需生成二维码）、
+    三个 sub 文件路径；每次请求都重新读文件。
     """
 
     base_url: str | None = (
@@ -432,7 +697,7 @@ class SubPageHandler(BaseHTTPRequestHandler):
         form = dict(parse_qsl(split.query, keep_blank_values=True))
         try:
             if path == "/":
-                page = sub_page_html("cfwarp-converter 订阅", self._index_body(form))
+                page = sub_page_html("cfwarp-converter 订阅", self._index_body())
                 self._send(page.encode("utf-8"), 200, "text/html; charset=utf-8")
             elif path == CONVERT_PAGE:
                 # 订阅链接的内容端点：纯文本直出，与 sub 文件展示格式一致
@@ -443,6 +708,17 @@ class SubPageHandler(BaseHTTPRequestHandler):
                     return
                 except Exception as error:  # noqa: BLE001 - 转换失败也以纯文本返回
                     print(f"[!] 网页转换异常：{error}", flush=True)
+                    self._send_text(f"转换失败：{error}", 500)
+                    return
+                self._send_text(content)
+            elif path == OPENVPN_CONVERT_PAGE:
+                try:
+                    content = run_openvpn_in_memory(form)
+                except ValueError as error:
+                    self._send_text(str(error), 400)
+                    return
+                except Exception as error:  # noqa: BLE001 - 转换失败也以纯文本返回
+                    print(f"[!] OpenVPN 网页转换异常：{error}", flush=True)
                     self._send_text(f"转换失败：{error}", 500)
                     return
                 self._send_text(content)
@@ -471,32 +747,25 @@ class SubPageHandler(BaseHTTPRequestHandler):
             print(f"[!] 页面生成异常（{path}）：{error}", flush=True)
             self._send_text(f"500 页面生成异常：{error}", 500)
 
-    def _index_body(self, form: dict[str, str]) -> str:
-        cards, rows = [], []
+    def _index_body(self) -> str:
+        cards = []
         for name in SUB_PAGE_FILES:
             path = BASE_DIR / name
-            if path.exists():
-                rows.append(
-                    f'<a class="row" href="/{name}" target="_blank"><b>{name}</b>'
-                    f"<span>{path.stat().st_size:,} 字节 · 点击查看内容</span></a>"
-                )
-            else:
-                rows.append(
-                    f'<div class="row"><b class="miss">{name}</b>'
-                    '<span class="miss">（未生成，执行对应转换命令后出现）</span></div>'
-                )
-            if path.exists() and self.base_url and segno is not None:
+            exists = path.exists()
+            if exists and self.base_url and segno is not None:
                 qr = _qr_data_uri(f"{self.base_url}/{name}")
+                size = path.stat().st_size
                 cards.append(
                     f'<div class="card"><img class="qr" src="{qr}" alt="{name} 二维码">'
-                    f'<div class="qname">{name}</div>'
-                    f'<div class="qurl">{self.base_url}/{name}</div></div>'
+                    f'<div class="qname">{name}<span class="qsize">（{size:,} 字节）</span></div>'
+                    f'<a class="qurl" href="/{name}" target="_blank" rel="noopener" '
+                    f'title="点击在新标签页打开">{self.base_url}/{name}</a></div>'
                 )
             else:
                 if segno is None:
                     hint = "未安装 segno"
                 else:
-                    hint = "文件未生成" if not path.exists() else "无局域网地址"
+                    hint = "文件未生成" if not exists else "无局域网地址"
                 cards.append(
                     f'<div class="card"><div class="qrmiss">{hint}</div>'
                     f'<div class="qname">{name}</div></div>'
@@ -511,27 +780,29 @@ class SubPageHandler(BaseHTTPRequestHandler):
         else:
             tip = '<p class="tip">未检测到局域网地址，二维码不可用（手机与电脑需在同一网络）。</p>'
         return (
+            f"<script>var LAN_BASE={json.dumps(self.base_url)}</script>"
             "<h1>cfwarp-converter</h1>"
-            '<p class="sub">订阅内容实时读取 exe 同目录文件，重新转换后刷新本页即最新</p>'
+            '<p class="sub">下面三个二维码和对应的链接，即sub文件的订阅内容，如果没有显示，需执行CLI命令生成sub文件再刷新本页</p>'
             f'<div class="grid">{"".join(cards)}</div>{tip}'
-            f'<div class="list">{"".join(rows)}</div>' + self._form_section(form)
+            + self._form_section()
+            + _openvpn_form_section()
         )
 
-    def _form_section(self, form: dict[str, str]) -> str:
+    def _form_section(self) -> str:
         """首页内嵌的订阅链接生成区：表单 + 生成结果（初始隐藏，JS 填充）。"""
         return (
-            "<h2>订阅链接生成</h2>"
-            '<p class="sub">选择客户端与参数生成一个订阅链接；打开或扫码该链接都会'
-            "<b>实时重新转换</b>，内容与 sub 文件格式一致，直接显示在浏览器中，"
-            "不写入任何文件，多用户互不影响。</p>"
-            f'<form class="form" id="cform">{_form_fields(form)}'
+            "<h2>【基础玩法】订阅链接生成</h2>"
+            '<p class="sub">选择对应的客户端与参数生成一个订阅链接，复制打开或扫码该链接对应的二维码即可</p>'
+            '<form class="form" id="cform" oninput="staleForm(\'cform\')" '
+            "onchange=\"staleForm('cform')\">"
+            f"{_form_fields()}"
             '<button type="button" onclick="genLink()">生成订阅链接</button></form>'
             '<div class="subgen" id="subgen" style="display:none">'
             '<div id="subresult">'
             '<div class="subrow"><img id="subqr" class="subqr" alt="订阅链接二维码">'
             '<code id="suburl" class="suburl" onclick="copySubUrl()" '
             'title="点击复制订阅链接"></code></div>'
-            '<div class="qrerr" id="qrerr">订阅链接过长，无法生成二维码</div>'
+            '<div class="qrerr" id="qrerr">二维码生成失败（未安装 segno 或链接过长），链接本身仍可使用</div>'
             "</div>"
             '<div class="substale" id="substale">参数已变更，请点击“生成订阅链接”重新生成</div>'
             "</div>" + _FORM_SCRIPT
@@ -544,8 +815,7 @@ class SubPageHandler(BaseHTTPRequestHandler):
     def _send(self, data: bytes, status: int, content_type: str) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        # no-store：禁止浏览器缓存，保证重新生成文件后刷新即最新内容
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-store")  # 禁止缓存
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -554,13 +824,32 @@ class SubPageHandler(BaseHTTPRequestHandler):
         pass  # 静默访问日志，避免刷屏
 
 
+class SubPageServer(ThreadingHTTPServer):
+    """订阅服务：客户端探测/断开造成的连接中断只提示一行，不刷 traceback。"""
+
+    def handle_error(self, request, client_address) -> None:
+        error = sys.exc_info()[1]
+        # ConnectionResetError(10054)/ConnectionAbortedError(10053)/BrokenPipeError
+        # 的共同基类是 ConnectionError；TimeoutError 为套接字超时，同属预期中断
+        if isinstance(error, (ConnectionError, TimeoutError)):
+            address = (
+                f"{client_address[0]}:{client_address[1]}" if client_address else "?"
+            )
+            print(
+                f"[!] 客户端 {address} 连接中断！",
+                flush=True,
+            )
+            return
+        super().handle_error(request, client_address)
+
+
 def server_sub_page(host: str, port: int) -> None:
     """启动本地订阅与网页转换服务（Ctrl+C 停止）。"""
     # server 模式接管输出：转换结果进内存不落盘（CLI 的 --server 组合中，
     # 转换先于本调用执行完毕，照常写 sub 文件，不受影响）
     main.write_text_file = _memory_write_text_file
     try:
-        server = ThreadingHTTPServer((host, port), SubPageHandler)
+        server = SubPageServer((host, port), SubPageHandler)
     except OSError as error:
         print(f"[!] 无法监听 {host}:{port}：{error}（端口可能被占用）")
         return
