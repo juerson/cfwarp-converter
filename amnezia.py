@@ -5,7 +5,7 @@
   - 常量：AMNEZIA_DEFAULT / AMNEZIA_RANDOM / AMNEZIA_INT_KEYS
   - CLI 开关注册：add_amnezia_arg
   - 解析 / 下发：amnezia_mode / amnezia_config_fields
-  - 每节点随机生成：generate_amnezia_params（含真实加密的 QUIC v1 Initial 构造）
+  - 每节点随机生成：generate_amnezia_params（含 TLS 1.3 ClientHello 的 QUIC v1 Initial 构造）
 
 QUIC 加密用 RFC 9001（HKDF + AES-128-GCM AEAD + AES-ECB header protection），
 依赖第三方库 cryptography；HKDF 用标准库 hashlib/hmac。
@@ -92,6 +92,15 @@ AMNEZIA_INT_KEYS = frozenset(
 # Initial 用固定 salt 从 DCID 派生密钥（RFC 9001 §5.2）
 _QUIC_V1_SALT = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
 
+# ClientHello 未指定 SNI 时随机挑选的真实站点（解密视角与真实流量一致）
+_DEFAULT_QUIC_SNIS = (
+    "one.one.one.one",
+    "speed.cloudflare.com",
+    "developers.cloudflare.com",
+    "www.cloudflare.com",
+    "cdn.jsdelivr.net",
+)
+
 
 def _quic_varint(value: int) -> bytes:
     """QUIC 可变长度整数编码（RFC 9000 §16）。"""
@@ -137,14 +146,99 @@ def _aes_ecb_encrypt(key: bytes, data: bytes) -> bytes:
     return encryptor.update(data) + encryptor.finalize()
 
 
+def _tls_ext(ext_type: int, payload: bytes) -> bytes:
+    return ext_type.to_bytes(2, "big") + len(payload).to_bytes(2, "big") + payload
+
+
+def _quic_tp(param_id: int, value: bytes) -> bytes:
+    return _quic_varint(param_id) + _quic_varint(len(value)) + value
+
+
+def _build_quic_client_hello(
+    rng: random.Random, scid: bytes, sni: str | None = None
+) -> bytes:
+    """构造可放入 QUIC CRYPTO 帧的合法 TLS 1.3 ClientHello（RFC 8446 / 9001）。"""
+    host = (sni or rng.choice(_DEFAULT_QUIC_SNIS)).encode("ascii")
+    sni_entry = b"\x00" + len(host).to_bytes(2, "big") + host
+    sni_payload = len(sni_entry).to_bytes(2, "big") + sni_entry
+
+    # X25519 随机公钥（RFC 7748 清除最高位）
+    x25519_pub = bytearray(rng.randrange(256) for _ in range(32))
+    x25519_pub[31] &= 0x7F
+    key_share_entry = b"\x00\x1d\x00\x20" + bytes(x25519_pub)
+    key_share_payload = len(key_share_entry).to_bytes(2, "big") + key_share_entry
+
+    # RFC 9000 §18.2 常见客户端传输参数；0x0f 必须与包头 SCID 一致
+    transport_params = b"".join(
+        [
+            _quic_tp(0x01, _quic_varint(30000)),  # max_idle_timeout (30s)
+            _quic_tp(0x03, _quic_varint(1472)),  # max_udp_payload_size
+            _quic_tp(0x04, _quic_varint(15728640)),  # initial_max_data
+            _quic_tp(0x05, _quic_varint(6291456)),  # initial_max_stream_data_bidi_local
+            _quic_tp(
+                0x06, _quic_varint(6291456)
+            ),  # initial_max_stream_data_bidi_remote
+            _quic_tp(0x07, _quic_varint(6291456)),  # initial_max_stream_data_uni
+            _quic_tp(0x08, _quic_varint(100)),  # initial_max_streams_bidi
+            _quic_tp(0x09, _quic_varint(100)),  # initial_max_streams_uni
+            _quic_tp(0x0F, scid),  # initial_source_connection_id
+        ]
+    )
+
+    alpn_proto = b"\x02h3"
+    groups = bytes.fromhex("001d00170018")  # x25519, secp256r1, secp384r1
+    sig_algs = bytes.fromhex("04030804040105030805050108060601")
+
+    extensions = b"".join(
+        [
+            _tls_ext(0x0000, sni_payload),  # server_name
+            _tls_ext(
+                0x000A, len(groups).to_bytes(2, "big") + groups
+            ),  # supported_groups
+            _tls_ext(
+                0x000D, len(sig_algs).to_bytes(2, "big") + sig_algs
+            ),  # signature_algorithms
+            _tls_ext(
+                0x0010, len(alpn_proto).to_bytes(2, "big") + alpn_proto
+            ),  # ALPN: h3
+            _tls_ext(0x002D, b"\x01\x01"),  # psk_key_exchange_modes
+            _tls_ext(0x002B, b"\x02\x03\x04"),  # supported_versions: TLS 1.3
+            _tls_ext(0x0033, key_share_payload),  # key_share
+            _tls_ext(0x0039, transport_params),  # quic_transport_parameters
+        ]
+    )
+
+    client_random = bytes(rng.randrange(256) for _ in range(32))
+    cipher_suites = bytes.fromhex(
+        "130113021303"
+    )  # AES-128-GCM / AES-256-GCM / ChaCha20
+    body = b"".join(
+        [
+            b"\x03\x03",  # legacy_version (TLS 1.2)
+            client_random,
+            b"\x00",  # QUIC 必须为 0 字节 session_id (RFC 9001 §8.4)
+            len(cipher_suites).to_bytes(2, "big") + cipher_suites,
+            b"\x01\x00",  # legacy_compression_methods: null
+            len(extensions).to_bytes(2, "big") + extensions,
+        ]
+    )
+    return b"\x01" + len(body).to_bytes(3, "big") + body
+
+
 def build_quic_initial(
-    rng: random.Random, version: int = 0x00000001, size: int = 1200, jitter: int = 32
+    rng: random.Random,
+    version: int = 0x00000001,
+    size: int = 1200,
+    jitter: int = 32,
+    *,
+    sni: str | None = None,
+    pn: int = 0,
 ) -> str:
     """构造一个真实加密的 QUIC v1 Initial 长头包，返回 HEX 字节串（RFC 9001）。
 
-    固定身份：首字节（长头 + Initial + pn_len）、version；随机：DCID/SCID、
-    packet number、加密 padding、长度（size ± jitter）。payload 为全 PADDING（合法 frames），
-    可被标准 QUIC 解析器解密校验通过。
+    内部携带合法的 CRYPTO 帧（TLS 1.3 ClientHello + quic_transport_parameters）与
+    PADDING 帧，可被标准 QUIC 解析器 / DPI 解密并正常解析出 ClientHello（内容级拟真）。
+    size 为目标包长（± jitter 抖动）；ClientHello 约 220~240 字节，size 过小会被撑到下限。
     """
     if not _HAVE_CRYPTO:
         raise RuntimeError(
@@ -152,12 +246,12 @@ def build_quic_initial(
         )
 
     total = size + (rng.randint(0, jitter) if jitter else 0)
-    dcid = bytes(
-        rng.randrange(256) for _ in range(8)
-    )  # v1 客户端 Initial DCID ≥ 8 字节
-    scid = bytes(rng.randrange(256) for _ in range(8))
-    pn_len = 4
-    pn = rng.randrange(1, 1 << (8 * pn_len))
+    dcid_len = rng.randint(8, 20)  # v1 客户端 Initial DCID 要求 ≥ 8 字节
+    scid_len = 0 if rng.random() < 0.7 else rng.randint(4, 16)
+    dcid = bytes(rng.randrange(256) for _ in range(dcid_len))
+    scid = bytes(rng.randrange(256) for _ in range(scid_len))
+
+    pn_len = 1 if pn < 0x100 else (2 if pn < 0x10000 else 4)
     pn_bytes = pn.to_bytes(pn_len, "big")
     first = 0xC0 | (0 << 4) | (pn_len - 1)  # long header + Initial
 
@@ -170,12 +264,18 @@ def build_quic_initial(
     header += _quic_varint(0)  # Token Length = 0
     base = bytes(header)
 
+    client_hello = _build_quic_client_hello(rng, scid, sni=sni)
+    crypto_frame = (
+        b"\x06" + _quic_varint(0) + _quic_varint(len(client_hello)) + client_hello
+    )
+
     tag_len = 16
-    length_bytes = _quic_varint(pn_len + 1 + tag_len)
-    plaintext_len = 1
+    min_plain = len(crypto_frame)
+    length_bytes = _quic_varint(pn_len + min_plain + tag_len)
+    plaintext_len = min_plain
     for _ in range(4):  # 迭代使 Length varint 稳定
         cipher_len = total - len(base) - len(length_bytes) - pn_len
-        plaintext_len = max(cipher_len - tag_len, 1)
+        plaintext_len = max(cipher_len - tag_len, min_plain)
         new_length = _quic_varint(pn_len + plaintext_len + tag_len)
         if new_length == length_bytes:
             break
@@ -190,11 +290,13 @@ def build_quic_initial(
     iv = _hkdf_expand_label(client_secret, b"quic iv", b"", 12)
     hp = _hkdf_expand_label(client_secret, b"quic hp", b"", 16)
 
-    plaintext = b"\x00" * plaintext_len  # 全 PADDING：合法 QUIC frames
+    plaintext = crypto_frame + b"\x00" * (plaintext_len - len(crypto_frame))
     nonce = bytes(a ^ b for a, b in zip(iv, pn.to_bytes(12, "big")))
     ciphertext = AESGCM(key).encrypt(nonce, plaintext, aad)
 
-    sample = ciphertext[:16]  # sample 取 pn_offset+4 起 16 字节
+    # RFC 9001 §5.4.2: sample 起点固定为 pn_offset + 4，即 ciphertext[4 - pn_len:]
+    sample_offset = 4 - pn_len
+    sample = ciphertext[sample_offset : sample_offset + 16]
     hp_mask = _aes_ecb_encrypt(hp, sample)
     protected_first = header_no_pn[0] ^ (hp_mask[0] & 0x0F)
     protected_pn = bytes(b ^ hp_mask[1 + i] for i, b in enumerate(pn_bytes))
@@ -205,9 +307,9 @@ def build_quic_initial(
 
 def generate_amnezia_params(
     *,
-    jc_range: tuple[int, int] = (4, 12),
-    jmin_range: tuple[int, int] = (1, 64),
-    jmax_range: tuple[int, int] = (128, 1200),
+    jc_range: tuple[int, int] = (4, 10), # (4, 10)
+    jmin_range: tuple[int, int] = (40, 64),# (40, 128)
+    jmax_range: tuple[int, int] = (128, 1000),# (256, 1100)
     quic_version: int = 0x00000001,
     quic_size: int = 1200,
     quic_jitter: int = 32,
@@ -215,7 +317,7 @@ def generate_amnezia_params(
 ) -> dict[str, str]:
     """随机生成一套 WARP 可用的 AmneziaWG 参数，返回有序 dict。
 
-    默认 H1~H4=1/2/3/4（WARP 兼容）、无 S；随机 Jc/Jmin/Jmax；i1、i2 为真实加密的
+    默认 H1~H4=1/2/3/4（WARP 兼容）、无 S；随机 Jc/Jmin/Jmax；i1 为真实加密的
     QUIC v1 Initial（标签语法 `<b 0x..>`）。每次调用都产生不同结果，适合给**每个节点**各生成一套。
     """
     rng = rng or random.SystemRandom()
@@ -224,15 +326,17 @@ def generate_amnezia_params(
     params["jc"] = str(rng.randint(*jc_range))
     jmin = rng.randint(*jmin_range)
     params["jmin"] = str(jmin)
-    params["jmax"] = str(rng.randint(max(jmax_range[0], jmin), jmax_range[1]))
+    jmax_low = max(jmax_range[0], jmin + 1)
+    jmax_high = max(jmax_range[1], jmax_low)
+    params["jmax"] = str(rng.randint(jmax_low, jmax_high))
     params.update({"h1": "1", "h2": "2", "h3": "3", "h4": "4"})
 
     params["i1"] = (
         f"<b 0x{build_quic_initial(rng, quic_version, quic_size, quic_jitter)}>"
     )
-    params["i2"] = (
-        f"<b 0x{build_quic_initial(rng, quic_version, quic_size, quic_jitter)}>"
-    )
+    # params["i2"] = (
+    #     f"<b 0x{build_quic_initial(rng, quic_version, quic_size, quic_jitter)}>"
+    # )
     return params
 
 
@@ -248,7 +352,7 @@ def add_amnezia_arg(parser: argparse.ArgumentParser) -> None:
         const=AMNEZIA_RANDOM,
         default=None,
         metavar="KEY=VALUE&...",
-        help="启用 AmneziaWG 混淆（仅 wg 协议）：省略=禁用；不带值=每个节点"
+        help="启用 AmneziaWG 混淆（wg/mix 协议）：省略=禁用；不带值=每个节点"
         '各随机生成一套参数；带值形如 "jc=120&jmin=23&i1=..."=所有节点'
         "共用这套固定参数",
     )
@@ -259,7 +363,7 @@ def parse_amnezia_params(value: str) -> dict[str, str]:
     params: dict[str, str] = {}
     for item in re.split(r"[&,]", value):
         key, sep, val = item.partition("=")
-        key = key.strip()
+        key = key.strip().lower()
         if sep and key:
             params[key] = val.strip()
     return params
